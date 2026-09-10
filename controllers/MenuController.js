@@ -46,10 +46,36 @@ const getAllMenus = async (req, res) => {
 
         const [menus] = await db.query(query, params);
 
-        const formattedMenus = menus.map(m => ({
-            ...m,
-            is_active: Boolean(m.is_active)
-        }));
+        // Buat map ID -> menu untuk memudahkan pencarian Module dan Sub Module
+        const menuMap = new Map(menus.map(m => [m.id, m]));
+
+        const formattedMenus = menus.map(m => {
+            let moduleName = '-';
+            let subModuleName = '-';
+
+            if (!m.parent_id) {
+                moduleName = m.name;
+            } else {
+                const parent = menuMap.get(m.parent_id);
+                if (parent) {
+                    if (!parent.parent_id) {
+                        moduleName = parent.name;
+                    } else {
+                        const grandParent = menuMap.get(parent.parent_id);
+                        moduleName = grandParent ? grandParent.name : parent.name;
+                        subModuleName = parent.name;
+                    }
+                }
+            }
+
+            return {
+                ...m,
+                module: moduleName,
+                sub_module: subModuleName,
+                need_approval: Boolean(m.need_approval),
+                is_active: Boolean(m.is_active)
+            };
+        });
 
         if (tree === 'true') {
             const menuTree = buildMenuTree(formattedMenus, null);
@@ -75,6 +101,7 @@ const getMenuById = async (req, res) => {
 
         const menu = {
             ...rows[0],
+            need_approval: Boolean(rows[0].need_approval),
             is_active: Boolean(rows[0].is_active)
         };
 
@@ -88,7 +115,7 @@ const getMenuById = async (req, res) => {
 // Menambahkan menu baru
 const createMenu = async (req, res) => {
     try {
-        const { parent_id, name, path, icon, sequence = 0, is_active = true } = req.body;
+        const { parent_id, name, path, icon, sequence = 0, is_active = true, need_approval = false } = req.body;
 
         if (!name) {
             return badRequestResponse(res, 'Field name wajib diisi');
@@ -105,8 +132,8 @@ const createMenu = async (req, res) => {
         const id = crypto.randomUUID();
 
         await db.query(
-            `INSERT INTO m_menus (id, parent_id, name, path, icon, sequence, is_active) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO m_menus (id, parent_id, name, path, icon, sequence, is_active, need_approval) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 id,
                 parent_id || null,
@@ -114,7 +141,8 @@ const createMenu = async (req, res) => {
                 path || null,
                 icon || null,
                 sequence !== undefined ? Number(sequence) : 0,
-                is_active ? 1 : 0
+                is_active ? 1 : 0,
+                need_approval ? 1 : 0
             ]
         );
 
@@ -122,6 +150,7 @@ const createMenu = async (req, res) => {
 
         const resultData = {
             ...newMenu[0],
+            need_approval: Boolean(newMenu[0].need_approval),
             is_active: Boolean(newMenu[0].is_active)
         };
 
@@ -144,7 +173,7 @@ const createMenu = async (req, res) => {
 const updateMenu = async (req, res) => {
     try {
         const { id } = req.params;
-        const { parent_id, name, path, icon, sequence, is_active } = req.body;
+        const { parent_id, name, path, icon, sequence, is_active, need_approval } = req.body;
 
         const [existing] = await db.query('SELECT * FROM m_menus WHERE id = ?', [id]);
         if (existing.length === 0) {
@@ -171,12 +200,13 @@ const updateMenu = async (req, res) => {
         const newIcon = icon !== undefined ? icon : current.icon;
         const newSequence = sequence !== undefined ? Number(sequence) : current.sequence;
         const newIsActive = is_active !== undefined ? (is_active ? 1 : 0) : current.is_active;
+        const newNeedApproval = need_approval !== undefined ? (need_approval ? 1 : 0) : (current.need_approval ? 1 : 0);
 
         await db.query(
             `UPDATE m_menus 
-             SET parent_id = ?, name = ?, path = ?, icon = ?, sequence = ?, is_active = ? 
+             SET parent_id = ?, name = ?, path = ?, icon = ?, sequence = ?, is_active = ?, need_approval = ? 
              WHERE id = ?`,
-            [newParentId, newName, newPath, newIcon, newSequence, newIsActive, id]
+            [newParentId, newName, newPath, newIcon, newSequence, newIsActive, newNeedApproval, id]
         );
 
         const [updatedMenu] = await db.query('SELECT * FROM m_menus WHERE id = ?', [id]);

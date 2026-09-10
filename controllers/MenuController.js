@@ -238,48 +238,94 @@ const getUserNavigation = async (req, res) => {
         const userId = req.user.id;
 
         // Ambil role-role yang dimiliki user
-        const [userRoles] = await db.query('SELECT role_id FROM user_roles WHERE user_id = ?', [userId]);
+        const [userRoles] = await db.query(
+            `SELECT r.id, r.code 
+             FROM user_roles ur 
+             JOIN m_roles r ON ur.role_id = r.id 
+             WHERE ur.user_id = ?`,
+            [userId]
+        );
 
         if (userRoles.length === 0) {
             return successResponse(res, [], 'User belum memiliki role yang ditentukan');
         }
 
-        const roleIds = userRoles.map(r => r.role_id);
-        const placeholders = roleIds.map(() => '?').join(',');
+        const isAdmin = userRoles.some(r => r.code && r.code.toUpperCase() === 'ADMIN');
+        let formatted = [];
 
-        // Query gabungan: Mengambil menu aktif yang diberi izin can_read = TRUE untuk role user
-        // Menggunakan GROUP BY m.id dan fungsi MAX() untuk menggabungkan izin jika user memiliki > 1 role
-        const [menus] = await db.query(
-            `SELECT 
-                m.id,
-                m.parent_id,
-                m.name,
-                m.path,
-                m.icon,
-                m.sequence,
-                MAX(rm.can_read) AS can_read,
-                MAX(rm.can_create) AS can_create,
-                MAX(rm.can_update) AS can_update,
-                MAX(rm.can_delete) AS can_delete,
-                MAX(rm.can_print) AS can_print
-             FROM m_menus m
-             JOIN role_menus rm ON m.id = rm.menu_id
-             WHERE rm.role_id IN (${placeholders})
-               AND m.is_active = 1
-               AND rm.can_read = 1
-             GROUP BY m.id, m.parent_id, m.name, m.path, m.icon, m.sequence
-             ORDER BY m.sequence ASC, m.name ASC`,
-            roleIds
-        );
+        if (isAdmin) {
+            // Administrator mendapatkan semua menu aktif dari m_menus
+            const [menus] = await db.query(
+                `SELECT 
+                    id,
+                    parent_id,
+                    name,
+                    path,
+                    icon,
+                    sequence,
+                    1 AS can_read,
+                    1 AS can_create,
+                    1 AS can_update,
+                    1 AS can_delete,
+                    1 AS can_print
+                 FROM m_menus
+                 WHERE is_active = 1
+                 ORDER BY sequence ASC, name ASC`
+            );
 
-        const formatted = menus.map(m => ({
-            ...m,
-            can_read: Boolean(m.can_read),
-            can_create: Boolean(m.can_create),
-            can_update: Boolean(m.can_update),
-            can_delete: Boolean(m.can_delete),
-            can_print: Boolean(m.can_print)
-        }));
+            formatted = menus.map(m => ({
+                ...m,
+                can_read: true,
+                can_create: true,
+                can_update: true,
+                can_delete: true,
+                can_print: true
+            }));
+        } else {
+            const roleIds = userRoles.map(r => r.id);
+            const placeholders = roleIds.map(() => '?').join(',');
+
+            // Query menu aktif yang diberi izin can_read = 1 atau parent dari menu yang dapat dibaca
+            const [menus] = await db.query(
+                `SELECT 
+                    m.id,
+                    m.parent_id,
+                    m.name,
+                    m.path,
+                    m.icon,
+                    m.sequence,
+                    MAX(rm.can_read) AS can_read,
+                    MAX(rm.can_create) AS can_create,
+                    MAX(rm.can_update) AS can_update,
+                    MAX(rm.can_delete) AS can_delete,
+                    MAX(rm.can_print) AS can_print
+                 FROM m_menus m
+                 LEFT JOIN role_menus rm ON m.id = rm.menu_id AND rm.role_id IN (${placeholders})
+                 WHERE m.is_active = 1
+                   AND (
+                       rm.can_read = 1
+                       OR m.id IN (
+                           SELECT DISTINCT p.id 
+                           FROM m_menus p
+                           JOIN m_menus c ON c.parent_id = p.id
+                           JOIN role_menus rm2 ON c.id = rm2.menu_id
+                           WHERE rm2.role_id IN (${placeholders}) AND rm2.can_read = 1 AND p.is_active = 1
+                       )
+                   )
+                 GROUP BY m.id, m.parent_id, m.name, m.path, m.icon, m.sequence
+                 ORDER BY m.sequence ASC, m.name ASC`,
+                [...roleIds, ...roleIds]
+            );
+
+            formatted = menus.map(m => ({
+                ...m,
+                can_read: Boolean(m.can_read),
+                can_create: Boolean(m.can_create),
+                can_update: Boolean(m.can_update),
+                can_delete: Boolean(m.can_delete),
+                can_print: Boolean(m.can_print)
+            }));
+        }
 
         // Susun menjadi hierarki tree untuk kemudahan rendering sidebar di frontend
         const navigationTree = buildMenuTree(formatted, null);

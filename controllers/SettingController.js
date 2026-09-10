@@ -33,7 +33,7 @@ const getAllSettings = async (req, res) => {
             params.push(searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern);
         }
 
-        query += ' ORDER BY `group` ASC, `key` ASC';
+        query += ' ORDER BY `group` ASC, CAST(COALESCE(value2, 999) AS SIGNED) ASC, `key` ASC';
 
         const [rows] = await db.query(query, params);
 

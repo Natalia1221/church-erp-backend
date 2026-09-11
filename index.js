@@ -40,7 +40,12 @@ app.use('/api/sermons', sermonRoutes);
 app.use('/api/minggu', mingguRoutes);
 app.use('/api/lainnya', lainnyaRoutes);
 
-// Menyalakan Server
-app.listen(port, () => {
-    console.log(`🚀 Server Express berjalan di http://localhost:${port}`);
-});
+// Menyalakan Server jika dijalankan secara lokal/standalone
+if (require.main === module || !process.env.VERCEL) {
+    app.listen(port, () => {
+        console.log(`🚀 Server Express berjalan di http://localhost:${port}`);
+    });
+}
+
+// Export instance express untuk Vercel Serverless Function
+module.exports = app;

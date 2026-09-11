@@ -17,6 +17,9 @@ const userRoutes = require('./routes/userRoutes');
 const menuRoutes = require('./routes/menuRoutes');
 const settingRoutes = require('./routes/settingRoutes');
 const categoryRoutes = require('./routes/categoryRoutes');
+const sermonRoutes = require('./routes/sermonRoutes');
+const mingguRoutes = require('./routes/mingguRoutes');
+const lainnyaRoutes = require('./routes/lainnyaRoutes');
 
 // Route dasar (Root) untuk memastikan API berjalan
 app.get('/', (req, res) => {
@@ -26,13 +29,16 @@ app.get('/', (req, res) => {
     });
 });
 
-// Endpoint Modul Auth, Role, User, Menu, Setting, dan Kategori
+// Endpoint Modul Auth, Role, User, Menu, Setting, Kategori, Sermon, Minggu, dan Lainnya
 app.use('/api/auth', authRoutes);
 app.use('/api/roles', roleRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/menus', menuRoutes);
 app.use('/api/settings', settingRoutes);
 app.use('/api/categories', categoryRoutes);
+app.use('/api/sermons', sermonRoutes);
+app.use('/api/minggu', mingguRoutes);
+app.use('/api/lainnya', lainnyaRoutes);
 
 // Menyalakan Server
 app.listen(port, () => {

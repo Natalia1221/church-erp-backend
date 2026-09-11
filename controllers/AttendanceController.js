@@ -209,8 +209,272 @@ const getMyHistory = async (req, res) => {
     }
 };
 
+// 4. Monitoring Absensi Acara Real-Time (Khusus Admin & Pendeta)
+const getEventMonitoring = async (req, res) => {
+    try {
+        const { eventId } = req.params;
+
+        // Ambil info acara
+        const [events] = await db.query(`
+            SELECT 
+                id, 
+                event_type, 
+                DATE_FORMAT(event_date, '%Y-%m-%d') AS event_date, 
+                title, 
+                is_attendance,
+                created_at
+            FROM t_events
+            WHERE id = ?
+        `, [eventId]);
+
+        if (events.length === 0) {
+            return notFoundResponse(res, 'Acara ibadah tidak ditemukan');
+        }
+
+        const event = events[0];
+
+        // Ambil seluruh penugasan kategori pada acara ini beserta status absensinya
+        const [scheduledAssignments] = await db.query(`
+            SELECT 
+                ta.id AS assignment_id,
+                ta.category_id,
+                c.name AS category_name,
+                c.sequence AS category_sequence,
+                ta.user_id,
+                u.name AS user_name,
+                u.email AS user_email,
+                att.id AS attendance_id,
+                att.check_in_time,
+                att.latitude,
+                att.longitude,
+                att.photo_proof,
+                CASE WHEN att.id IS NOT NULL THEN 1 ELSE 0 END AS is_attended
+            FROM t_assignments ta
+            JOIN m_categories c ON ta.category_id = c.id
+            LEFT JOIN users u ON ta.user_id = u.id
+            LEFT JOIN t_attendances att ON att.event_id = ta.event_id AND att.user_id = ta.user_id
+            WHERE ta.event_id = ?
+            ORDER BY CAST(c.sequence AS DECIMAL(10,2)) ASC, c.name ASC
+        `, [eventId]);
+
+        // Ambil pelayan tambahan / non-terjadwal yang hadir pada acara ini
+        const [additionalAttendees] = await db.query(`
+            SELECT 
+                att.id AS attendance_id,
+                att.user_id,
+                u.name AS user_name,
+                u.email AS user_email,
+                att.check_in_time,
+                att.latitude,
+                att.longitude,
+                att.photo_proof,
+                0 AS is_scheduled
+            FROM t_attendances att
+            JOIN users u ON att.user_id = u.id
+            WHERE att.event_id = ? 
+              AND att.user_id NOT IN (
+                SELECT user_id FROM t_assignments WHERE event_id = ? AND user_id IS NOT NULL
+              )
+            ORDER BY att.check_in_time ASC
+        `, [eventId, eventId]);
+
+        // Hitung statistik
+        const assignedWithUser = scheduledAssignments.filter(a => Boolean(a.user_id));
+        const totalScheduled = assignedWithUser.length;
+        const attendedScheduled = assignedWithUser.filter(a => a.is_attended === 1).length;
+        const unattendedScheduled = totalScheduled - attendedScheduled;
+        const totalAdditional = additionalAttendees.length;
+        const totalPresent = attendedScheduled + totalAdditional;
+        const attendancePercentage = totalScheduled > 0 
+            ? Math.round((attendedScheduled / totalScheduled) * 100) 
+            : 0;
+
+        const stats = {
+            total_scheduled: totalScheduled,
+            attended_scheduled: attendedScheduled,
+            unattended_scheduled: unattendedScheduled,
+            additional_attendees: totalAdditional,
+            total_present: totalPresent,
+            attendance_percentage: attendancePercentage
+        };
+
+        // Ambil juga list user GSM aktif untuk opsi "Tandai Hadir Manual"
+        const [allGsmUsers] = await db.query(`
+            SELECT u.id, u.name, u.email
+            FROM users u
+            JOIN user_roles ur ON u.id = ur.user_id
+            JOIN m_roles r ON ur.role_id = r.id AND r.code = 'GSM'
+            WHERE u.is_active = 1 AND u.deleted_at IS NULL
+            ORDER BY u.name ASC
+        `);
+
+        return successResponse(res, {
+            event,
+            stats,
+            scheduled_assignments: scheduledAssignments,
+            additional_attendees: additionalAttendees,
+            available_gsm_users: allGsmUsers
+        }, 'Data monitoring absensi berhasil diambil');
+    } catch (error) {
+        console.error('Error getEventMonitoring:', error);
+        return errorResponse(res, 'Gagal mengambil data monitoring absensi', 500, error.message);
+    }
+};
+
+// 5. Tandai Hadir Manual oleh Admin / Pendeta
+const manualCheckIn = async (req, res) => {
+    try {
+        const adminId = req.user.id;
+        const { event_id, user_id, notes } = req.body;
+
+        if (!event_id || !user_id) {
+            return badRequestResponse(res, 'Field event_id dan user_id wajib diisi');
+        }
+
+        // Cek apakah sudah pernah check-in
+        const [existing] = await db.query(
+            'SELECT id FROM t_attendances WHERE event_id = ? AND user_id = ?',
+            [event_id, user_id]
+        );
+
+        if (existing.length > 0) {
+            return badRequestResponse(res, 'Pengguna sudah tercatat hadir pada acara ini');
+        }
+
+        // Cek apakah terjadwal
+        const [scheduled] = await db.query(
+            'SELECT id FROM t_assignments WHERE event_id = ? AND user_id = ?',
+            [event_id, user_id]
+        );
+        const isScheduled = scheduled.length > 0 ? 1 : 0;
+
+        const attendanceId = crypto.randomUUID();
+        const proofLabel = notes ? `MANUAL: ${notes}` : 'MANUAL_BY_ADMIN';
+
+        await db.query(
+            `INSERT INTO t_attendances 
+                (id, event_id, user_id, check_in_time, is_scheduled, photo_proof) 
+             VALUES (?, ?, ?, NOW(), ?, ?)`,
+            [attendanceId, event_id, user_id, isScheduled, proofLabel]
+        );
+
+        // Ambil nama user untuk audit log
+        const [targetUser] = await db.query('SELECT name FROM users WHERE id = ?', [user_id]);
+        const userName = targetUser[0]?.name || user_id;
+
+        await logAudit({
+            userId: adminId,
+            action: 'MANUAL_CHECK_IN',
+            tableName: 't_attendances',
+            description: `Tandai hadir manual oleh admin untuk user ${userName} pada acara ${event_id}`
+        });
+
+        return createdResponse(res, {
+            id: attendanceId,
+            event_id,
+            user_id,
+            is_scheduled: isScheduled,
+            check_in_time: new Date()
+        }, 'Kehadiran berhasil dicatat secara manual!');
+    } catch (error) {
+        console.error('Error manualCheckIn:', error);
+        return errorResponse(res, 'Gagal mencatat kehadiran manual', 500, error.message);
+    }
+};
+
+// 6. Batalkan / Hapus Catatan Kehadiran
+const deleteAttendance = async (req, res) => {
+    try {
+        const adminId = req.user.id;
+        const { id } = req.params;
+
+        const [existing] = await db.query('SELECT id, event_id, user_id FROM t_attendances WHERE id = ?', [id]);
+        if (existing.length === 0) {
+            return notFoundResponse(res, 'Catatan kehadiran tidak ditemukan');
+        }
+
+        await db.query('DELETE FROM t_attendances WHERE id = ?', [id]);
+
+        await logAudit({
+            userId: adminId,
+            action: 'DELETE_ATTENDANCE',
+            tableName: 't_attendances',
+            description: `Membatalkan/menghapus catatan absensi ID ${id}`
+        });
+
+        return successResponse(res, null, 'Catatan kehadiran berhasil dibatalkan / dihapus');
+    } catch (error) {
+        console.error('Error deleteAttendance:', error);
+        return errorResponse(res, 'Gagal membatalkan catatan kehadiran', 500, error.message);
+    }
+};
+
+// 7. Rekapitulasi Kehadiran GSM (Laporan Evaluasi)
+const getRecapReport = async (req, res) => {
+    try {
+        const { startDate, endDate, event_type } = req.query;
+
+        let eventFilter = '';
+        const params = [];
+
+        if (event_type && event_type !== 'ALL') {
+            eventFilter += ' AND e.event_type = ?';
+            params.push(event_type);
+        }
+
+        if (startDate) {
+            eventFilter += ' AND e.event_date >= ?';
+            params.push(startDate);
+        }
+
+        if (endDate) {
+            eventFilter += ' AND e.event_date <= ?';
+            params.push(endDate);
+        }
+
+        // Ambil data seluruh GSM dan rekap kehadirannya
+        const [recap] = await db.query(`
+            SELECT 
+                u.id AS user_id,
+                u.name AS user_name,
+                u.email AS user_email,
+                COUNT(DISTINCT ta.id) AS total_assignments,
+                COUNT(DISTINCT att.id) AS total_attendances,
+                COUNT(DISTINCT CASE WHEN att.is_scheduled = 1 THEN att.id END) AS attended_scheduled,
+                COUNT(DISTINCT CASE WHEN att.is_scheduled = 0 THEN att.id END) AS attended_additional
+            FROM users u
+            JOIN user_roles ur ON u.id = ur.user_id
+            JOIN m_roles r ON ur.role_id = r.id AND r.code = 'GSM'
+            LEFT JOIN t_assignments ta ON ta.user_id = u.id
+            LEFT JOIN t_events e ON ta.event_id = e.id ${eventFilter}
+            LEFT JOIN t_attendances att ON att.user_id = u.id AND att.event_id = e.id
+            WHERE u.is_active = 1 AND u.deleted_at IS NULL
+            GROUP BY u.id, u.name, u.email
+            ORDER BY total_attendances DESC, u.name ASC
+        `, params);
+
+        // Ambil total acara yang terlaksana dalam periode tersebut
+        const [totalEvents] = await db.query(`
+            SELECT COUNT(*) as count FROM t_events e WHERE COALESCE(e.is_attendance, 1) = 1 ${eventFilter}
+        `, params);
+
+        return successResponse(res, {
+            total_events: totalEvents[0]?.count || 0,
+            recap
+        }, 'Data rekapitulasi absensi berhasil dimuat');
+    } catch (error) {
+        console.error('Error getRecapReport:', error);
+        return errorResponse(res, 'Gagal memuat data rekapitulasi absensi', 500, error.message);
+    }
+};
+
 module.exports = {
     getTodayEvents,
     checkIn,
-    getMyHistory
+    getMyHistory,
+    getEventMonitoring,
+    manualCheckIn,
+    deleteAttendance,
+    getRecapReport
 };
+

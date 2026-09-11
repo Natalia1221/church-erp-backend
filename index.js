@@ -16,6 +16,7 @@ const roleRoutes = require('./routes/roleRoutes');
 const userRoutes = require('./routes/userRoutes');
 const menuRoutes = require('./routes/menuRoutes');
 const settingRoutes = require('./routes/settingRoutes');
+const categoryRoutes = require('./routes/categoryRoutes');
 
 // Route dasar (Root) untuk memastikan API berjalan
 app.get('/', (req, res) => {
@@ -25,12 +26,13 @@ app.get('/', (req, res) => {
     });
 });
 
-// Endpoint Modul Auth, Role, User, Menu, dan Setting
+// Endpoint Modul Auth, Role, User, Menu, Setting, dan Kategori
 app.use('/api/auth', authRoutes);
 app.use('/api/roles', roleRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/menus', menuRoutes);
 app.use('/api/settings', settingRoutes);
+app.use('/api/categories', categoryRoutes);
 
 // Menyalakan Server
 app.listen(port, () => {

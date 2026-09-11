@@ -10,23 +10,92 @@ const {
 const { logAudit } = require('../helpers/auditHelper');
 
 /**
- * Helper internal untuk menyusun daftar flat menu menjadi struktur tree hierarki (parent & children)
+ * Helper internal untuk menyusun daftar flat menu (berdasarkan modul & submodul) menjadi hierarki tree untuk Sidebar
  */
-const buildMenuTree = (menuList, parentId = null) => {
-    const branch = [];
+const buildNavTreeFromMenus = (menuList) => {
+    const moduleMap = new Map();
+
     for (const menu of menuList) {
-        if (menu.parent_id === parentId) {
-            const children = buildMenuTree(menuList, menu.id);
-            const item = { ...menu };
-            if (children.length > 0) {
-                item.children = children;
-            } else {
-                item.children = [];
-            }
-            branch.push(item);
+        const mod = menu.modul || menu.name || 'Lainnya';
+        if (!moduleMap.has(mod)) {
+            moduleMap.set(mod, []);
         }
+        moduleMap.get(mod).push(menu);
     }
-    return branch;
+
+    const navTree = [];
+
+    for (const [modName, items] of moduleMap.entries()) {
+        items.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+
+        // Jika hanya ada 1 item di modul dan path-nya ada serta submodul kosong, jadikan top-level menu langsung
+        if (items.length === 1 && !items[0].submodul && items[0].path) {
+            navTree.push({
+                ...items[0],
+                children: []
+            });
+            continue;
+        }
+
+        // Modul dengan grup submenu
+        const headerItem = items.find(i => i.name === modName && !i.submodul) || items[0];
+        const childItems = items.filter(i => i.id !== headerItem.id || (headerItem.path && items.length > 1));
+
+        const submodulGroups = new Map();
+        const directChildren = [];
+
+        for (const item of childItems) {
+            if (item.submodul) {
+                if (!submodulGroups.has(item.submodul)) {
+                    submodulGroups.set(item.submodul, []);
+                }
+                submodulGroups.get(item.submodul).push(item);
+            } else {
+                directChildren.push({
+                    ...item,
+                    children: []
+                });
+            }
+        }
+
+        const level2Children = [...directChildren];
+
+        for (const [submodName, subItems] of submodulGroups.entries()) {
+            subItems.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+            const subHeader = subItems.find(i => i.name === submodName) || subItems[0];
+            const level3Items = subItems.filter(i => i.id !== subHeader.id || (subHeader.path && subItems.length > 1));
+
+            if (level3Items.length > 0) {
+                level2Children.push({
+                    id: subHeader.id || `sub-${submodName}`,
+                    name: submodName,
+                    path: subHeader.path || null,
+                    icon: subHeader.icon || 'Folder',
+                    sequence: subHeader.sequence || 0,
+                    children: level3Items.map(c => ({ ...c, children: [] }))
+                });
+            } else {
+                level2Children.push({
+                    ...subHeader,
+                    children: []
+                });
+            }
+        }
+
+        level2Children.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+
+        navTree.push({
+            id: headerItem.id,
+            name: modName,
+            path: headerItem.path || null,
+            icon: headerItem.icon || 'Layers',
+            sequence: headerItem.sequence || 0,
+            children: level2Children
+        });
+    }
+
+    navTree.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+    return navTree;
 };
 
 // Mengambil semua menu (Mendukung format list flat atau hierarki tree via query ?tree=true)
@@ -34,7 +103,7 @@ const getAllMenus = async (req, res) => {
     try {
         const { tree, is_active } = req.query;
 
-        let query = 'SELECT * FROM m_menus WHERE 1=1';
+        let query = 'SELECT id, modul, submodul, name, path, icon, sequence, is_active, created_at FROM m_menus WHERE 1=1';
         const params = [];
 
         if (is_active !== undefined) {
@@ -46,39 +115,17 @@ const getAllMenus = async (req, res) => {
 
         const [menus] = await db.query(query, params);
 
-        // Buat map ID -> menu untuk memudahkan pencarian Module dan Sub Module
-        const menuMap = new Map(menus.map(m => [m.id, m]));
-
-        const formattedMenus = menus.map(m => {
-            let moduleName = '-';
-            let subModuleName = '-';
-
-            if (!m.parent_id) {
-                moduleName = m.name;
-            } else {
-                const parent = menuMap.get(m.parent_id);
-                if (parent) {
-                    if (!parent.parent_id) {
-                        moduleName = parent.name;
-                    } else {
-                        const grandParent = menuMap.get(parent.parent_id);
-                        moduleName = grandParent ? grandParent.name : parent.name;
-                        subModuleName = parent.name;
-                    }
-                }
-            }
-
-            return {
-                ...m,
-                module: moduleName,
-                sub_module: subModuleName,
-                need_approval: Boolean(m.need_approval),
-                is_active: Boolean(m.is_active)
-            };
-        });
+        const formattedMenus = menus.map(m => ({
+            ...m,
+            modul: m.modul || '-',
+            submodul: m.submodul || null,
+            module: m.modul || '-',
+            sub_module: m.submodul || '-',
+            is_active: Boolean(m.is_active)
+        }));
 
         if (tree === 'true') {
-            const menuTree = buildMenuTree(formattedMenus, null);
+            const menuTree = buildNavTreeFromMenus(formattedMenus);
             return successResponse(res, menuTree, 'Daftar menu hierarkis berhasil diambil');
         }
 
@@ -101,7 +148,8 @@ const getMenuById = async (req, res) => {
 
         const menu = {
             ...rows[0],
-            need_approval: Boolean(rows[0].need_approval),
+            module: rows[0].modul || '-',
+            sub_module: rows[0].submodul || '-',
             is_active: Boolean(rows[0].is_active)
         };
 
@@ -115,34 +163,36 @@ const getMenuById = async (req, res) => {
 // Menambahkan menu baru
 const createMenu = async (req, res) => {
     try {
-        const { parent_id, name, path, icon, sequence = 0, is_active = true, need_approval = false } = req.body;
+        const { modul, submodul, name, path, icon, sequence = 0, is_active = true } = req.body;
 
-        if (!name) {
-            return badRequestResponse(res, 'Field name wajib diisi');
+        if (!name || !name.trim()) {
+            return badRequestResponse(res, 'Nama Menu wajib diisi');
         }
-
-        // Cek validitas parent_id jika disediakan
-        if (parent_id) {
-            const [parent] = await db.query('SELECT id FROM m_menus WHERE id = ?', [parent_id]);
-            if (parent.length === 0) {
-                return badRequestResponse(res, `Parent menu dengan ID '${parent_id}' tidak ditemukan`);
-            }
+        if (!modul || !modul.trim()) {
+            return badRequestResponse(res, 'Modul wajib diisi');
         }
 
         const id = crypto.randomUUID();
+        const trimmedModul = modul.trim();
+        const trimmedSubmodul = submodul && submodul.trim() ? submodul.trim() : null;
+        const trimmedName = name.trim();
+        const trimmedPath = path && path.trim() ? path.trim() : null;
+        const trimmedIcon = icon && icon.trim() ? icon.trim() : 'Layers';
+        const parsedSequence = sequence !== undefined && sequence !== null && sequence !== '' ? Number(sequence) : 0;
+        const activeFlag = is_active ? 1 : 0;
 
         await db.query(
-            `INSERT INTO m_menus (id, parent_id, name, path, icon, sequence, is_active, need_approval) 
+            `INSERT INTO m_menus (id, modul, submodul, name, path, icon, sequence, is_active) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 id,
-                parent_id || null,
-                name,
-                path || null,
-                icon || null,
-                sequence !== undefined ? Number(sequence) : 0,
-                is_active ? 1 : 0,
-                need_approval ? 1 : 0
+                trimmedModul,
+                trimmedSubmodul,
+                trimmedName,
+                trimmedPath,
+                trimmedIcon,
+                parsedSequence,
+                activeFlag
             ]
         );
 
@@ -150,7 +200,8 @@ const createMenu = async (req, res) => {
 
         const resultData = {
             ...newMenu[0],
-            need_approval: Boolean(newMenu[0].need_approval),
+            module: newMenu[0].modul || '-',
+            sub_module: newMenu[0].submodul || '-',
             is_active: Boolean(newMenu[0].is_active)
         };
 
@@ -159,7 +210,7 @@ const createMenu = async (req, res) => {
             userId: req.user?.id || null,
             action: 'CREATE',
             tableName: 'm_menus',
-            description: `Menambahkan menu baru: ${name} (Path: ${path || '-'})`
+            description: `Menambahkan menu baru: ${trimmedName} (Modul: ${trimmedModul}, Submodul: ${trimmedSubmodul || '-'}, Path: ${trimmedPath || '-'})`
         });
 
         return createdResponse(res, resultData, 'Menu berhasil ditambahkan');
@@ -173,46 +224,35 @@ const createMenu = async (req, res) => {
 const updateMenu = async (req, res) => {
     try {
         const { id } = req.params;
-        const { parent_id, name, path, icon, sequence, is_active, need_approval } = req.body;
+        const { modul, submodul, name, path, icon, sequence, is_active } = req.body;
 
         const [existing] = await db.query('SELECT * FROM m_menus WHERE id = ?', [id]);
         if (existing.length === 0) {
             return notFoundResponse(res, `Menu dengan ID '${id}' tidak ditemukan`);
         }
 
-        // Hindari membuat menu menjadi parent dari dirinya sendiri
-        if (parent_id === id) {
-            return badRequestResponse(res, 'Menu tidak bisa menjadi parent untuk dirinya sendiri');
-        }
-
-        // Validasi parent_id jika diubah
-        if (parent_id) {
-            const [parent] = await db.query('SELECT id FROM m_menus WHERE id = ?', [parent_id]);
-            if (parent.length === 0) {
-                return badRequestResponse(res, `Parent menu dengan ID '${parent_id}' tidak ditemukan`);
-            }
-        }
-
         const current = existing[0];
-        const newParentId = parent_id !== undefined ? (parent_id || null) : current.parent_id;
-        const newName = name !== undefined ? name : current.name;
-        const newPath = path !== undefined ? path : current.path;
-        const newIcon = icon !== undefined ? icon : current.icon;
-        const newSequence = sequence !== undefined ? Number(sequence) : current.sequence;
+        const newModul = modul !== undefined ? (modul ? modul.trim() : current.modul) : current.modul;
+        const newSubmodul = submodul !== undefined ? (submodul ? submodul.trim() : null) : current.submodul;
+        const newName = name !== undefined ? name.trim() : current.name;
+        const newPath = path !== undefined ? (path ? path.trim() : null) : current.path;
+        const newIcon = icon !== undefined ? (icon ? icon.trim() : null) : current.icon;
+        const newSequence = sequence !== undefined && sequence !== null && sequence !== '' ? Number(sequence) : current.sequence;
         const newIsActive = is_active !== undefined ? (is_active ? 1 : 0) : current.is_active;
-        const newNeedApproval = need_approval !== undefined ? (need_approval ? 1 : 0) : (current.need_approval ? 1 : 0);
 
         await db.query(
             `UPDATE m_menus 
-             SET parent_id = ?, name = ?, path = ?, icon = ?, sequence = ?, is_active = ?, need_approval = ? 
+             SET modul = ?, submodul = ?, name = ?, path = ?, icon = ?, sequence = ?, is_active = ? 
              WHERE id = ?`,
-            [newParentId, newName, newPath, newIcon, newSequence, newIsActive, newNeedApproval, id]
+            [newModul, newSubmodul, newName, newPath, newIcon, newSequence, newIsActive, id]
         );
 
         const [updatedMenu] = await db.query('SELECT * FROM m_menus WHERE id = ?', [id]);
 
         const resultData = {
             ...updatedMenu[0],
+            module: updatedMenu[0].modul || '-',
+            sub_module: updatedMenu[0].submodul || '-',
             is_active: Boolean(updatedMenu[0].is_active)
         };
 
@@ -243,7 +283,6 @@ const deleteMenu = async (req, res) => {
 
         const target = existing[0];
 
-        // Karena FOREIGN KEY parent_id diset ON DELETE CASCADE, submenu akan otomatis terhapus
         await db.query('DELETE FROM m_menus WHERE id = ?', [id]);
 
         // Catat ke audit log
@@ -254,7 +293,7 @@ const deleteMenu = async (req, res) => {
             description: `Menghapus menu: ${target.name} (ID: ${id})`
         });
 
-        return successResponse(res, null, 'Menu dan submenunya berhasil dihapus');
+        return successResponse(res, null, 'Menu berhasil dihapus');
     } catch (error) {
         console.error('Error deleteMenu:', error);
         return errorResponse(res, 'Terjadi kesalahan pada server saat menghapus menu', 500, error.message);
@@ -262,17 +301,16 @@ const deleteMenu = async (req, res) => {
 };
 
 // Mengambil Navigasi Menu Pengguna yang sedang Login (/api/menus/my-menus)
-// Digunakan frontend (Vue.js) untuk merender Sidebar sesuai izin can_read role user
 const getUserNavigation = async (req, res) => {
     try {
         const userId = req.user.id;
 
-        // Ambil role-role yang dimiliki user
+        // Ambil role-role aktif yang dimiliki user
         const [userRoles] = await db.query(
             `SELECT r.id, r.code 
              FROM user_roles ur 
              JOIN m_roles r ON ur.role_id = r.id 
-             WHERE ur.user_id = ?`,
+             WHERE ur.user_id = ? AND COALESCE(r.status, 1) = 1`,
             [userId]
         );
 
@@ -288,11 +326,13 @@ const getUserNavigation = async (req, res) => {
             const [menus] = await db.query(
                 `SELECT 
                     id,
-                    parent_id,
+                    modul,
+                    submodul,
                     name,
                     path,
                     icon,
                     sequence,
+                    1 AS can_show,
                     1 AS can_read,
                     1 AS can_create,
                     1 AS can_update,
@@ -305,6 +345,7 @@ const getUserNavigation = async (req, res) => {
 
             formatted = menus.map(m => ({
                 ...m,
+                can_show: true,
                 can_read: true,
                 can_create: true,
                 can_update: true,
@@ -315,15 +356,16 @@ const getUserNavigation = async (req, res) => {
             const roleIds = userRoles.map(r => r.id);
             const placeholders = roleIds.map(() => '?').join(',');
 
-            // Query menu aktif yang diberi izin can_read = 1 atau parent dari menu yang dapat dibaca
             const [menus] = await db.query(
                 `SELECT 
                     m.id,
-                    m.parent_id,
+                    m.modul,
+                    m.submodul,
                     m.name,
                     m.path,
                     m.icon,
                     m.sequence,
+                    MAX(COALESCE(rm.can_show, rm.can_read, 0)) AS can_show,
                     MAX(rm.can_read) AS can_read,
                     MAX(rm.can_create) AS can_create,
                     MAX(rm.can_update) AS can_update,
@@ -333,22 +375,18 @@ const getUserNavigation = async (req, res) => {
                  LEFT JOIN role_menus rm ON m.id = rm.menu_id AND rm.role_id IN (${placeholders})
                  WHERE m.is_active = 1
                    AND (
-                       rm.can_read = 1
-                       OR m.id IN (
-                           SELECT DISTINCT p.id 
-                           FROM m_menus p
-                           JOIN m_menus c ON c.parent_id = p.id
-                           JOIN role_menus rm2 ON c.id = rm2.menu_id
-                           WHERE rm2.role_id IN (${placeholders}) AND rm2.can_read = 1 AND p.is_active = 1
-                       )
+                       rm.can_show = 1
+                       OR (rm.can_show IS NULL AND rm.can_read = 1)
+                       OR m.path IS NULL
                    )
-                 GROUP BY m.id, m.parent_id, m.name, m.path, m.icon, m.sequence
+                 GROUP BY m.id, m.modul, m.submodul, m.name, m.path, m.icon, m.sequence
                  ORDER BY m.sequence ASC, m.name ASC`,
-                [...roleIds, ...roleIds]
+                roleIds
             );
 
             formatted = menus.map(m => ({
                 ...m,
+                can_show: Boolean(m.can_show),
                 can_read: Boolean(m.can_read),
                 can_create: Boolean(m.can_create),
                 can_update: Boolean(m.can_update),
@@ -358,7 +396,7 @@ const getUserNavigation = async (req, res) => {
         }
 
         // Susun menjadi hierarki tree untuk kemudahan rendering sidebar di frontend
-        const navigationTree = buildMenuTree(formatted, null);
+        const navigationTree = buildNavTreeFromMenus(formatted);
 
         return successResponse(res, navigationTree, 'Navigasi menu user berhasil diambil');
     } catch (error) {

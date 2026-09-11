@@ -9,6 +9,7 @@ router.use(authenticateToken);
 
 // Route CRUD untuk m_roles
 router.get('/', RoleController.getAllRoles);
+router.get('/utils/next-code', RoleController.getNextRoleCode);
 router.get('/:id', RoleController.getRoleById);
 router.post('/', RoleController.createRole);
 router.put('/:id', RoleController.updateRole);

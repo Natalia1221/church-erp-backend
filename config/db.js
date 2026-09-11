@@ -1,9 +1,14 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
+// Bersihkan URI jika terdapat tanda petik atau spasi yang tidak sengaja terbawa di Environment Variables
+const rawUri = (process.env.DATABASE_URL || '').trim();
+const cleanUri = rawUri.replace(/^["']|["']$/g, '').trim();
+
 // Membuat connection pool untuk efisiensi performa
 const pool = mysql.createPool({
-  uri: process.env.DATABASE_URL,
+  uri: cleanUri,
+  ssl: { rejectUnauthorized: true },
   waitForConnections: true,
   connectionLimit: 10, // Batas maksimal koneksi bersamaan
   queueLimit: 0,

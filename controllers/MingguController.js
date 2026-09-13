@@ -22,10 +22,15 @@ const getAllMinggu = async (req, res) => {
                 e.title,
                 COALESCE(e.is_attendance, 1) AS is_attendance,
                 e.created_at,
-                COUNT(ta.id) AS total_attendance,
-                COUNT(CASE WHEN ta.check_in_time IS NOT NULL THEN 1 END) AS attended_count
+                (SELECT COUNT(DISTINCT ur.user_id) 
+                 FROM user_roles ur 
+                 JOIN m_roles r ON ur.role_id = r.id 
+                 JOIN users u ON ur.user_id = u.id 
+                 WHERE r.code = 'GSM' AND u.is_active = 1 AND u.deleted_at IS NULL) AS total_attendance,
+                (SELECT COUNT(DISTINCT ta.user_id) 
+                 FROM t_attendances ta 
+                 WHERE ta.event_id = e.id AND ta.check_in_time IS NOT NULL) AS attended_count
             FROM t_events e
-            LEFT JOIN t_attendances ta ON e.id = ta.event_id
             WHERE e.event_type = 'MINGGU'
         `;
         const params = [];
@@ -37,7 +42,6 @@ const getAllMinggu = async (req, res) => {
         }
 
         query += `
-            GROUP BY e.id, e.event_type, e.event_date, e.title, e.is_attendance, e.created_at
             ORDER BY e.event_date DESC, e.created_at DESC
         `;
 
@@ -73,7 +77,7 @@ const getAllMinggu = async (req, res) => {
 
         const formatted = rows.map(item => ({
             ...item,
-            is_attendance: Boolean(item.is_attendance),
+            is_attendance: Number(item.is_attendance) === 1,
             total_attendance: Number(item.total_attendance || 0),
             attended_count: Number(item.attended_count || 0),
             assignments: assignmentMap[item.id] || []
@@ -111,7 +115,7 @@ const getMingguById = async (req, res) => {
 
         const minggu = {
             ...events[0],
-            is_attendance: Boolean(events[0].is_attendance)
+            is_attendance: Number(events[0].is_attendance) === 1
         };
 
         // Ambil daftar GSM dari t_attendances
@@ -215,10 +219,22 @@ const createMinggu = async (req, res) => {
             return badRequestResponse(res, 'Tanggal yang dipilih haruslah hari Minggu!');
         }
 
+        // Validasi: Tidak boleh ada acara Minggu ganda pada tanggal yang sama
+        const [existingDate] = await db.query(
+            "SELECT id, title FROM t_events WHERE event_type = 'MINGGU' AND event_date = ?",
+            [trimmedDate]
+        );
+        if (existingDate.length > 0) {
+            return badRequestResponse(
+                res,
+                `Acara Ibadah Minggu untuk tanggal ${trimmedDate} sudah ada (${existingDate[0].title}). Tanggal acara ibadah minggu tidak boleh sama/duplikat.`
+            );
+        }
+
         // Title otomatis berformat MINGGU_TANGGAL
         const generatedTitle = `MINGGU_${trimmedDate}`;
         const eventId = crypto.randomUUID();
-        const activeAttendance = is_attendance ? 1 : 0;
+        const activeAttendance = (is_attendance === false || is_attendance === 0 || is_attendance === '0' || is_attendance === 'false') ? 0 : 1;
 
         connection = await db.getConnection();
         await connection.beginTransaction();
@@ -248,30 +264,15 @@ const createMinggu = async (req, res) => {
             createdAssignmentsCount = categories.length;
         }
 
-        let gsmAssignedCount = 0;
-
-        // 3. Apabila melakukan absensi dicentang, buat baris data di t_attendances untuk seluruh role GSM
-        if (activeAttendance === 1) {
-            const [gsmUsers] = await connection.query(
-                `SELECT DISTINCT u.id, u.name 
-                 FROM users u 
-                 JOIN user_roles ur ON u.id = ur.user_id 
-                 JOIN m_roles r ON ur.role_id = r.id 
-                 WHERE r.code = 'GSM' AND u.is_active = 1`
-            );
-
-            if (gsmUsers.length > 0) {
-                for (const user of gsmUsers) {
-                    const attendanceId = crypto.randomUUID();
-                    await connection.query(
-                        `INSERT INTO t_attendances (id, event_id, user_id, is_scheduled) 
-                         VALUES (?, ?, ?, 1)`,
-                        [attendanceId, eventId, user.id]
-                    );
-                }
-                gsmAssignedCount = gsmUsers.length;
-            }
-        }
+        // Hitung total GSM aktif untuk info respons
+        const [gsmUsers] = await connection.query(
+            `SELECT COUNT(DISTINCT u.id) AS total_gsm 
+             FROM users u 
+             JOIN user_roles ur ON u.id = ur.user_id 
+             JOIN m_roles r ON ur.role_id = r.id 
+             WHERE r.code = 'GSM' AND u.is_active = 1 AND u.deleted_at IS NULL`
+        );
+        const totalGsmCount = gsmUsers[0]?.total_gsm || 0;
 
         await connection.commit();
 
@@ -286,15 +287,15 @@ const createMinggu = async (req, res) => {
             userId: req.user?.id || null,
             action: 'CREATE',
             tableName: 't_events',
-            description: `Menambahkan acara Minggu baru: ${generatedTitle} (${trimmedDate}) dengan ${createdAssignmentsCount} kategori penugasan dan ${gsmAssignedCount} GSM terdaftar di absensi`
+            description: `Menambahkan acara Minggu baru: ${generatedTitle} (${trimmedDate}) dengan ${createdAssignmentsCount} kategori penugasan`
         });
 
         return createdResponse(
             res,
             {
                 ...created[0],
-                is_attendance: Boolean(created[0].is_attendance),
-                total_attendance: gsmAssignedCount,
+                is_attendance: Number(created[0].is_attendance) === 1,
+                total_attendance: totalGsmCount,
                 attended_count: 0,
                 assignments_created: createdAssignmentsCount
             },

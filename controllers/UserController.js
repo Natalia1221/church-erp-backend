@@ -120,22 +120,25 @@ const createUser = async (req, res) => {
         const { name, email, password, is_active = true, role_id, role_ids } = req.body;
 
         if (!name || !email || !password) {
-            return badRequestResponse(res, 'Field name, email, dan password wajib diisi');
+            return badRequestResponse(res, 'Field name, email / username, dan password wajib diisi');
         }
 
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return badRequestResponse(res, 'Format email tidak valid');
+        const identifier = email.trim();
+        if (/\s/.test(identifier)) {
+            return badRequestResponse(res, 'Email atau username tidak boleh mengandung spasi');
+        }
+        if (identifier.length < 3) {
+            return badRequestResponse(res, 'Email atau username minimal 3 karakter');
         }
 
         if (password.length < 6) {
             return badRequestResponse(res, 'Password minimal 6 karakter');
         }
 
-        // Cek apakah email sudah terdaftar
-        const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
+        // Cek apakah email/username sudah terdaftar
+        const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [identifier]);
         if (existing.length > 0) {
-            return errorResponse(res, 'Email sudah terdaftar, gunakan email lain', 409);
+            return errorResponse(res, 'Email / username sudah terdaftar, gunakan yang lain', 409);
         }
 
         const saltRounds = 10;
@@ -155,7 +158,7 @@ const createUser = async (req, res) => {
 
         await connection.query(
             'INSERT INTO users (id, name, email, password_hash, is_active) VALUES (?, ?, ?, ?, ?)',
-            [userId, name, email, password_hash, is_active ? 1 : 0]
+            [userId, name, identifier, password_hash, is_active ? 1 : 0]
         );
 
         for (const rId of targetRoles) {
@@ -228,14 +231,15 @@ const updateUser = async (req, res) => {
             return notFoundResponse(res, `User dengan ID '${id}' tidak ditemukan`);
         }
 
-        // Cek apakah email baru sudah dipakai user lain
-        if (email && email !== users[0].email) {
+        // Cek apakah email/username baru sudah dipakai user lain
+        if (email && email.trim() !== users[0].email) {
+            const identifier = email.trim();
             const [emailInUse] = await db.query(
                 'SELECT id FROM users WHERE email = ? AND id != ?',
-                [email, id]
+                [identifier, id]
             );
             if (emailInUse.length > 0) {
-                return errorResponse(res, 'Email sudah digunakan oleh user lain', 409);
+                return errorResponse(res, 'Email / username sudah digunakan oleh user lain', 409);
             }
         }
 
@@ -249,12 +253,15 @@ const updateUser = async (req, res) => {
         }
 
         if (email !== undefined) {
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            if (!emailRegex.test(email)) {
-                return badRequestResponse(res, 'Format email tidak valid');
+            const identifier = email.trim();
+            if (/\s/.test(identifier)) {
+                return badRequestResponse(res, 'Email atau username tidak boleh mengandung spasi');
+            }
+            if (identifier.length < 3) {
+                return badRequestResponse(res, 'Email atau username minimal 3 karakter');
             }
             updates.push('email = ?');
-            params.push(email);
+            params.push(identifier);
         }
 
         if (is_active !== undefined) {

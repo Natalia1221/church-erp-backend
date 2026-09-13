@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
 const db = require('../config/db');
 const {
     successResponse,
@@ -9,10 +11,85 @@ const {
 } = require('../helpers/responseHelper');
 const { logAudit } = require('../helpers/auditHelper');
 
+/**
+ * Menghitung jarak antara dua titik koordinat geolokasi menggunakan Haversine Formula (dalam meter)
+ */
+const calculateDistanceInMeters = (lat1, lon1, lat2, lon2) => {
+    const R = 6371e3; // Radius bumi dalam meter
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Math.round(R * c);
+};
+
+/**
+ * Mengambil konfigurasi absensi (titik koordinat gereja, batas radius, aturan GPS & foto) dari m_settings
+ */
+const getAttendanceConfig = async () => {
+    const [rows] = await db.query(
+        "SELECT `group`, `key`, value1, value2, value3, value4, status FROM m_settings WHERE `group` IN ('attendance_config', 'church_location') AND COALESCE(status, 1) = 1"
+    );
+
+    let config = {
+        church_latitude: null,
+        church_longitude: null,
+        max_radius_meters: 150,
+        require_gps: true,
+        require_photo: true,
+        church_name: 'Gereja HKBP'
+    };
+
+    // Prioritas 1: group church_location (format terpadu)
+    const churchLoc = rows.find(r => r.group === 'church_location');
+    if (churchLoc) {
+        if (churchLoc.value1) config.church_latitude = parseFloat(churchLoc.value1);
+        if (churchLoc.value2) config.church_longitude = parseFloat(churchLoc.value2);
+        if (churchLoc.value3) config.max_radius_meters = parseInt(churchLoc.value3, 10) || 150;
+        if (churchLoc.value4) config.church_name = churchLoc.value4;
+    }
+
+    // Prioritas 2: group attendance_config (format spesifik)
+    for (const r of rows) {
+        if (r.group === 'attendance_config') {
+            const k = (r.key || '').toUpperCase();
+            if (k === 'CHURCH_LATITUDE' && r.value1) {
+                config.church_latitude = parseFloat(r.value1);
+            } else if (k === 'CHURCH_LONGITUDE' && r.value1) {
+                config.church_longitude = parseFloat(r.value1);
+            } else if (k === 'MAX_RADIUS_METERS' && r.value1) {
+                config.max_radius_meters = parseInt(r.value1, 10) || config.max_radius_meters;
+            } else if (k === 'REQUIRE_GPS') {
+                config.require_gps = r.value1 === '1' || r.value1 === 'true';
+            } else if (k === 'REQUIRE_PHOTO') {
+                config.require_photo = r.value1 === '1' || r.value1 === 'true';
+            }
+        }
+    }
+
+    return config;
+};
+
 // 1. Mengambil acara aktif beserta status kehadiran & penugasan user saat ini
 const getTodayEvents = async (req, res) => {
     try {
         const userId = req.user.id;
+
+        // Ambil konfigurasi lokasi gereja & absensi dari m_settings
+        const attendanceConfig = await getAttendanceConfig();
+
+        // Ambil role pengguna saat ini untuk verifikasi hak akses
+        const [userRoles] = await db.query(
+            `SELECT r.code FROM user_roles ur JOIN m_roles r ON ur.role_id = r.id WHERE ur.user_id = ?`,
+            [userId]
+        );
+        const isAdminOrPendeta = userRoles.some(r => r.code === 'ADMIN' || r.code === 'PENDETA');
+
+        // Tanggal hari ini (WIB / Asia/Jakarta)
+        const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
 
         // Ambil acara terdekat / aktif (is_attendance = 1)
         const [events] = await db.query(`
@@ -21,17 +98,22 @@ const getTodayEvents = async (req, res) => {
                 e.event_type,
                 DATE_FORMAT(e.event_date, '%Y-%m-%d') AS event_date,
                 e.title,
-                COALESCE(e.is_attendance, 1) AS is_attendance,
+                e.is_attendance,
                 e.created_at,
-                (SELECT COUNT(*) FROM t_attendances WHERE event_id = e.id) AS total_attendees
+                (SELECT COUNT(DISTINCT ta.user_id) FROM t_attendances ta WHERE ta.event_id = e.id AND ta.check_in_time IS NOT NULL) AS total_attendees
             FROM t_events e
-            WHERE COALESCE(e.is_attendance, 1) = 1
+            WHERE e.is_attendance = 1
             ORDER BY e.event_date DESC, e.created_at DESC
-            LIMIT 15
+            LIMIT 50
         `);
 
         if (events.length === 0) {
-            return successResponse(res, [], 'Belum ada acara ibadah aktif');
+            return successResponse(res, {
+                events: [],
+                config: attendanceConfig,
+                today_date: todayStr,
+                is_admin: isAdminOrPendeta
+            }, 'Belum ada acara ibadah aktif');
         }
 
         const eventIds = events.map(e => e.id);
@@ -50,7 +132,12 @@ const getTodayEvents = async (req, res) => {
 
         const assignmentMap = {};
         for (const a of assignments) {
-            assignmentMap[a.event_id] = a;
+            if (!assignmentMap[a.event_id]) {
+                assignmentMap[a.event_id] = [];
+            }
+            if (a.category_name && !assignmentMap[a.event_id].includes(a.category_name)) {
+                assignmentMap[a.event_id].push(a.category_name);
+            }
         }
 
         // Ambil record absensi user pada acara-acara tersebut
@@ -64,7 +151,7 @@ const getTodayEvents = async (req, res) => {
                 longitude,
                 photo_proof
             FROM t_attendances
-            WHERE user_id = ? AND event_id IN (?)
+            WHERE user_id = ? AND event_id IN (?) AND check_in_time IS NOT NULL
         `, [userId, eventIds]);
 
         const attendanceMap = {};
@@ -73,26 +160,44 @@ const getTodayEvents = async (req, res) => {
         }
 
         const enrichedEvents = events.map(e => {
-            const assignment = assignmentMap[e.id] || null;
+            const userTasks = assignmentMap[e.id] || [];
+            const isAssigned = userTasks.length > 0;
+            const assignedCategory = isAssigned ? userTasks.join(', ') : null;
             const attendance = attendanceMap[e.id] || null;
+            const isCheckedIn = Boolean(attendance && attendance.check_in_time);
+            const eventDateStr = String(e.event_date);
+            const isToday = eventDateStr === todayStr;
+            const isPast = eventDateStr < todayStr;
+            const isFuture = eventDateStr > todayStr;
 
             return {
                 ...e,
-                is_assigned: Boolean(assignment),
-                assigned_category: assignment ? assignment.category_name : null,
-                is_checked_in: Boolean(attendance),
-                attendance_details: attendance
+                is_attendance: true,
+                is_assigned: isAssigned,
+                assigned_category: assignedCategory,
+                is_checked_in: isCheckedIn,
+                attendance_details: attendance,
+                today_date: todayStr,
+                is_today: isToday,
+                is_past: isPast,
+                is_future: isFuture,
+                can_check_in: isAdminOrPendeta || (isToday && !isCheckedIn)
             };
         });
 
-        return successResponse(res, enrichedEvents, 'Daftar acara aktif untuk absensi berhasil diambil');
+        return successResponse(res, {
+            events: enrichedEvents,
+            config: attendanceConfig,
+            today_date: todayStr,
+            is_admin: isAdminOrPendeta
+        }, 'Daftar acara aktif untuk absensi berhasil diambil');
     } catch (error) {
         console.error('Error getTodayEvents:', error);
         return errorResponse(res, 'Gagal mengambil data acara untuk absensi', 500, error.message);
     }
 };
 
-// 2. Melakukan Check-In Mandiri
+// 2. Melakukan Check-In Mandiri (Petugas / GSM) dengan Verifikasi Waktu Hari H, GPS Geofencing, & Live Foto Selfie
 const checkIn = async (req, res) => {
     try {
         const userId = req.user.id;
@@ -102,9 +207,10 @@ const checkIn = async (req, res) => {
             return badRequestResponse(res, 'Field event_id wajib diisi');
         }
 
-        // Cek validitas acara
+        // Cek validitas acara & tanggal pelaksanaan
         const [events] = await db.query(
-            'SELECT id, title, is_attendance FROM t_events WHERE id = ?',
+            `SELECT id, title, is_attendance, DATE_FORMAT(event_date, '%Y-%m-%d') AS event_date 
+             FROM t_events WHERE id = ?`,
             [event_id]
         );
 
@@ -114,17 +220,95 @@ const checkIn = async (req, res) => {
 
         const event = events[0];
         if (event.is_attendance === 0) {
-            return badRequestResponse(res, 'Absensi untuk acara ini tidak diaktifkan oleh admin');
+            return badRequestResponse(res, 'Absensi untuk acara ini tidak diaktifkan');
+        }
+
+        // Cek peran user
+        const [userRoles] = await db.query(
+            `SELECT r.code FROM user_roles ur JOIN m_roles r ON ur.role_id = r.id WHERE ur.user_id = ?`,
+            [userId]
+        );
+        const isAdminOrPendeta = userRoles.some(r => r.code === 'ADMIN' || r.code === 'PENDETA');
+
+        // Validasi Waktu: Absensi mandiri hanya bisa dilakukan di hari H acara
+        const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+        const eventDateStr = String(event.event_date);
+
+        if (!isAdminOrPendeta) {
+            if (eventDateStr < todayStr) {
+                return badRequestResponse(
+                    res,
+                    'Sesi absensi untuk acara ini telah berakhir karena tanggal pelaksanaan telah lewat. Absensi hanya dapat dilakukan pada hari H. Silakan hubungi Admin untuk revisi absensi.'
+                );
+            }
+            if (eventDateStr > todayStr) {
+                return badRequestResponse(
+                    res,
+                    `Sesi absensi belum dibuka. Absensi mandiri hanya dapat dilakukan pada hari H (${eventDateStr}).`
+                );
+            }
         }
 
         // Cek apakah user sudah pernah check-in
         const [existing] = await db.query(
-            'SELECT id, check_in_time FROM t_attendances WHERE event_id = ? AND user_id = ?',
+            'SELECT id, check_in_time FROM t_attendances WHERE event_id = ? AND user_id = ? AND check_in_time IS NOT NULL',
             [event_id, userId]
         );
 
         if (existing.length > 0) {
             return badRequestResponse(res, 'Anda sudah melakukan check-in untuk acara ini sebelumnya');
+        }
+
+        // Ambil konfigurasi absensi (titik koordinat gereja & radius) dari m_settings
+        const attendanceConfig = await getAttendanceConfig();
+
+        // 1. Validasi GPS Geofencing jika diaktifkan (require_gps)
+        let distanceMeters = null;
+        if (attendanceConfig.require_gps && attendanceConfig.church_latitude && attendanceConfig.church_longitude) {
+            if (latitude === undefined || latitude === null || longitude === undefined || longitude === null) {
+                return badRequestResponse(res, 'Izin lokasi GPS wajib diaktifkan pada browser/perangkat Anda untuk melakukan absensi.');
+            }
+
+            distanceMeters = calculateDistanceInMeters(
+                parseFloat(latitude),
+                parseFloat(longitude),
+                attendanceConfig.church_latitude,
+                attendanceConfig.church_longitude
+            );
+
+            if (distanceMeters > attendanceConfig.max_radius_meters) {
+                return badRequestResponse(
+                    res,
+                    `Lokasi Anda berada di luar radius gereja (${distanceMeters} meter). Batas jarak maksimal adalah ${attendanceConfig.max_radius_meters} meter dari ${attendanceConfig.church_name}. Absensi hanya dapat dilakukan di lingkungan gereja.`
+                );
+            }
+        }
+
+        // 2. Validasi Foto Selfie jika diaktifkan (require_photo)
+        let savedPhotoUrl = null;
+        if (attendanceConfig.require_photo && !photo_proof) {
+            return badRequestResponse(res, 'Foto bukti kehadiran (selfie) wajib disertakan untuk melakukan check-in.');
+        }
+
+        // Proses penyimpanan file foto jika berupa base64 image
+        if (photo_proof && typeof photo_proof === 'string') {
+            if (photo_proof.startsWith('data:image')) {
+                const matches = photo_proof.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+                if (matches && matches.length === 3) {
+                    const ext = matches[1].includes('png') ? 'png' : 'jpg';
+                    const base64Data = matches[2];
+                    const buffer = Buffer.from(base64Data, 'base64');
+                    const fileName = `att_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+                    const uploadsDir = path.join(__dirname, '..', 'uploads', 'attendances');
+                    if (!fs.existsSync(uploadsDir)) {
+                        fs.mkdirSync(uploadsDir, { recursive: true });
+                    }
+                    fs.writeFileSync(path.join(uploadsDir, fileName), buffer);
+                    savedPhotoUrl = `/uploads/attendances/${fileName}`;
+                }
+            } else if (photo_proof.startsWith('/uploads') || photo_proof.startsWith('http')) {
+                savedPhotoUrl = photo_proof;
+            }
         }
 
         // Cek apakah user terdaftar dalam t_assignments acara ini
@@ -146,7 +330,7 @@ const checkIn = async (req, res) => {
                 isScheduled,
                 latitude || null,
                 longitude || null,
-                photo_proof || null
+                savedPhotoUrl
             ]
         );
 
@@ -165,7 +349,7 @@ const checkIn = async (req, res) => {
             userId,
             action: 'CHECK_IN',
             tableName: 't_attendances',
-            description: `Check-in mandiri oleh user ID ${userId} pada acara ${event.title} (Terjadwal: ${isScheduled ? 'Ya' : 'Tidak'})`
+            description: `Check-in mandiri oleh user ID ${userId} pada acara ${event.title} (Jarak: ${distanceMeters !== null ? distanceMeters + 'm' : 'N/A'}, Terjadwal: ${isScheduled ? 'Ya' : 'Tidak'})`
         });
 
         return createdResponse(res, newRecord[0], 'Check-in kehadiran berhasil disimpan!');
@@ -192,12 +376,23 @@ const getMyHistory = async (req, res) => {
                 e.title AS event_title,
                 e.event_type,
                 DATE_FORMAT(e.event_date, '%Y-%m-%d') AS event_date,
-                c.name AS assigned_category_name
+                GROUP_CONCAT(DISTINCT c.name ORDER BY CAST(c.sequence AS DECIMAL(10,2)) ASC, c.name ASC SEPARATOR ', ') AS assigned_category_name
             FROM t_attendances ta
             JOIN t_events e ON ta.event_id = e.id
             LEFT JOIN t_assignments tass ON tass.event_id = e.id AND tass.user_id = ta.user_id
             LEFT JOIN m_categories c ON tass.category_id = c.id
             WHERE ta.user_id = ?
+            GROUP BY 
+                ta.id,
+                ta.event_id,
+                ta.check_in_time,
+                ta.is_scheduled,
+                ta.latitude,
+                ta.longitude,
+                ta.photo_proof,
+                e.title,
+                e.event_type,
+                e.event_date
             ORDER BY ta.check_in_time DESC
             LIMIT 50
         `, [userId]);
@@ -298,7 +493,35 @@ const getEventMonitoring = async (req, res) => {
             attendance_percentage: attendancePercentage
         };
 
-        // Ambil juga list user GSM aktif untuk opsi "Tandai Hadir Manual"
+        // Ambil daftar lengkap seluruh GSM aktif gereja beserta status kehadirannya pada acara ini
+        const [gsmAttendanceList] = await db.query(`
+            SELECT 
+                u.id AS user_id,
+                u.name AS user_name,
+                u.email AS user_email,
+                att.id AS attendance_id,
+                att.check_in_time,
+                att.latitude,
+                att.longitude,
+                att.photo_proof,
+                CASE WHEN att.id IS NOT NULL AND att.check_in_time IS NOT NULL THEN 1 ELSE 0 END AS is_attended,
+                assign.category_name
+            FROM users u
+            JOIN user_roles ur ON u.id = ur.user_id
+            JOIN m_roles r ON ur.role_id = r.id AND r.code = 'GSM'
+            LEFT JOIN t_attendances att ON att.user_id = u.id AND att.event_id = ? AND att.check_in_time IS NOT NULL
+            LEFT JOIN (
+                SELECT ta.user_id, GROUP_CONCAT(DISTINCT c.name ORDER BY CAST(c.sequence AS DECIMAL(10,2)) ASC, c.name ASC SEPARATOR ', ') AS category_name
+                FROM t_assignments ta
+                JOIN m_categories c ON ta.category_id = c.id
+                WHERE ta.event_id = ?
+                GROUP BY ta.user_id
+            ) assign ON assign.user_id = u.id
+            WHERE u.is_active = 1 AND u.deleted_at IS NULL
+            ORDER BY is_attended DESC, u.name ASC
+        `, [eventId, eventId]);
+
+        // Ambil juga list user GSM aktif
         const [allGsmUsers] = await db.query(`
             SELECT u.id, u.name, u.email
             FROM users u
@@ -313,7 +536,8 @@ const getEventMonitoring = async (req, res) => {
             stats,
             scheduled_assignments: scheduledAssignments,
             additional_attendees: additionalAttendees,
-            available_gsm_users: allGsmUsers
+            available_gsm_users: allGsmUsers,
+            gsm_attendance_list: gsmAttendanceList
         }, 'Data monitoring absensi berhasil diambil');
     } catch (error) {
         console.error('Error getEventMonitoring:', error);
@@ -409,12 +633,12 @@ const deleteAttendance = async (req, res) => {
     }
 };
 
-// 7. Rekapitulasi Kehadiran GSM (Laporan Evaluasi)
+// 7. Rekapitulasi Kehadiran GSM (Laporan Evaluasi & Rekap)
 const getRecapReport = async (req, res) => {
     try {
         const { startDate, endDate, event_type } = req.query;
 
-        let eventFilter = '';
+        let eventFilter = 'WHERE COALESCE(e.is_attendance, 1) = 1';
         const params = [];
 
         if (event_type && event_type !== 'ALL') {
@@ -432,34 +656,180 @@ const getRecapReport = async (req, res) => {
             params.push(endDate);
         }
 
-        // Ambil data seluruh GSM dan rekap kehadirannya
-        const [recap] = await db.query(`
-            SELECT 
-                u.id AS user_id,
-                u.name AS user_name,
-                u.email AS user_email,
-                COUNT(DISTINCT ta.id) AS total_assignments,
-                COUNT(DISTINCT att.id) AS total_attendances,
-                COUNT(DISTINCT CASE WHEN att.is_scheduled = 1 THEN att.id END) AS attended_scheduled,
-                COUNT(DISTINCT CASE WHEN att.is_scheduled = 0 THEN att.id END) AS attended_additional
+        // 1. Ambil seluruh event dalam periode filter
+        const [events] = await db.query(`
+            SELECT id, event_type, DATE_FORMAT(event_date, '%Y-%m-%d') AS event_date, title 
+            FROM t_events e 
+            ${eventFilter}
+            ORDER BY e.event_date ASC
+        `, params);
+
+        const totalEventsCount = events.length;
+        const eventIds = events.map(e => e.id);
+
+        // 2. Ambil seluruh GSM aktif
+        const [gsmUsers] = await db.query(`
+            SELECT DISTINCT u.id, u.name, u.email
             FROM users u
             JOIN user_roles ur ON u.id = ur.user_id
             JOIN m_roles r ON ur.role_id = r.id AND r.code = 'GSM'
-            LEFT JOIN t_assignments ta ON ta.user_id = u.id
-            LEFT JOIN t_events e ON ta.event_id = e.id ${eventFilter}
-            LEFT JOIN t_attendances att ON att.user_id = u.id AND att.event_id = e.id
             WHERE u.is_active = 1 AND u.deleted_at IS NULL
-            GROUP BY u.id, u.name, u.email
-            ORDER BY total_attendances DESC, u.name ASC
-        `, params);
+            ORDER BY u.name ASC
+        `);
 
-        // Ambil total acara yang terlaksana dalam periode tersebut
-        const [totalEvents] = await db.query(`
-            SELECT COUNT(*) as count FROM t_events e WHERE COALESCE(e.is_attendance, 1) = 1 ${eventFilter}
-        `, params);
+        if (eventIds.length === 0 || gsmUsers.length === 0) {
+            return successResponse(res, {
+                total_events: totalEventsCount,
+                total_gsm: gsmUsers.length,
+                active_gsm_count: 0,
+                overall_attendance_rate: 0,
+                total_attendances_all: 0,
+                self_check_in_count: 0,
+                manual_admin_count: 0,
+                recap: gsmUsers.map(u => ({
+                    user_id: u.id,
+                    user_name: u.name,
+                    user_email: u.email,
+                    total_assignments: 0,
+                    attended_scheduled: 0,
+                    attended_additional: 0,
+                    total_attendances: 0,
+                    unattended_scheduled: 0,
+                    attendance_rate: 0,
+                    status_badge: 'perlu_perhatian',
+                    attended_manual: 0,
+                    attended_self: 0
+                }))
+            }, 'Data rekapitulasi absensi berhasil dimuat');
+        }
+
+        // 3. Ambil penugasan (assignments) untuk event-event tersebut
+        const [assignments] = await db.query(`
+            SELECT event_id, user_id
+            FROM t_assignments
+            WHERE event_id IN (?)
+        `, [eventIds]);
+
+        // 4. Ambil absensi (attendances) untuk event-event tersebut
+        const [attendances] = await db.query(`
+            SELECT id, event_id, user_id, is_scheduled, photo_proof, check_in_time
+            FROM t_attendances
+            WHERE event_id IN (?) AND check_in_time IS NOT NULL
+        `, [eventIds]);
+
+        // Buat lookup map
+        const assignmentSet = new Set(assignments.map(a => `${a.event_id}_${a.user_id}`));
+        const userAssignmentsCount = {};
+        for (const a of assignments) {
+            userAssignmentsCount[a.user_id] = (userAssignmentsCount[a.user_id] || 0) + 1;
+        }
+
+        const userAttendanceList = {};
+        for (const att of attendances) {
+            if (!userAttendanceList[att.user_id]) {
+                userAttendanceList[att.user_id] = [];
+            }
+            userAttendanceList[att.user_id].push(att);
+        }
+
+        let totalSelfCheckIn = 0;
+        let totalManualAdmin = 0;
+        const totalAttendancesAll = attendances.length;
+
+        for (const att of attendances) {
+            const isManual = att.photo_proof?.startsWith('MANUAL') || att.photo_proof === 'MANUAL_BY_ADMIN';
+            if (isManual) {
+                totalManualAdmin++;
+            } else {
+                totalSelfCheckIn++;
+            }
+        }
+
+        const totalScheduledAll = assignments.length;
+        let attendedScheduledAll = 0;
+
+        const recap = gsmUsers.map(u => {
+            const myAtts = userAttendanceList[u.id] || [];
+            const totalAssigned = userAssignmentsCount[u.id] || 0;
+            
+            let attendedScheduled = 0;
+            let attendedAdditional = 0;
+            let attendedManual = 0;
+            let attendedSelf = 0;
+
+            for (const att of myAtts) {
+                const wasAssigned = assignmentSet.has(`${att.event_id}_${u.id}`);
+                if (wasAssigned || att.is_scheduled === 1) {
+                    attendedScheduled++;
+                } else {
+                    attendedAdditional++;
+                }
+
+                const isManual = att.photo_proof?.startsWith('MANUAL') || att.photo_proof === 'MANUAL_BY_ADMIN';
+                if (isManual) {
+                    attendedManual++;
+                } else {
+                    attendedSelf++;
+                }
+            }
+
+            attendedScheduledAll += attendedScheduled;
+            const unattendedScheduled = Math.max(0, totalAssigned - attendedScheduled);
+            const totalAttended = myAtts.length;
+
+            let rate = 0;
+            if (totalAssigned > 0) {
+                rate = Math.min(100, Math.round((attendedScheduled / totalAssigned) * 100));
+            } else if (totalAttended > 0) {
+                rate = 100;
+            }
+
+            let statusBadge = 'sangat_aktif';
+            if (rate >= 85) {
+                statusBadge = 'sangat_aktif';
+            } else if (rate >= 70) {
+                statusBadge = 'cukup';
+            } else {
+                statusBadge = 'perlu_perhatian';
+            }
+
+            return {
+                user_id: u.id,
+                user_name: u.name,
+                user_email: u.email,
+                total_assignments: totalAssigned,
+                attended_scheduled: attendedScheduled,
+                attended_additional: attendedAdditional,
+                total_attendances: totalAttended,
+                unattended_scheduled: unattendedScheduled,
+                attendance_rate: rate,
+                status_badge: statusBadge,
+                attended_manual: attendedManual,
+                attended_self: attendedSelf
+            };
+        });
+
+        // Urutkan berdasarkan total kehadiran dan persentase tertinggi
+        recap.sort((a, b) => {
+            if (b.total_attendances !== a.total_attendances) {
+                return b.total_attendances - a.total_attendances;
+            }
+            return b.attendance_rate - a.attendance_rate;
+        });
+
+        const activeGsmCount = recap.filter(r => r.total_attendances > 0).length;
+        const overallRate = totalScheduledAll > 0 
+            ? Math.min(100, Math.round((attendedScheduledAll / totalScheduledAll) * 100))
+            : (totalEventsCount > 0 && activeGsmCount > 0 ? 100 : 0);
 
         return successResponse(res, {
-            total_events: totalEvents[0]?.count || 0,
+            total_events: totalEventsCount,
+            total_gsm: gsmUsers.length,
+            active_gsm_count: activeGsmCount,
+            overall_attendance_rate: overallRate,
+            total_attendances_all: totalAttendancesAll,
+            self_check_in_count: totalSelfCheckIn,
+            manual_admin_count: totalManualAdmin,
             recap
         }, 'Data rekapitulasi absensi berhasil dimuat');
     } catch (error) {

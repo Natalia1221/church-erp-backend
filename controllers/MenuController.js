@@ -10,46 +10,85 @@ const {
 const { logAudit } = require('../helpers/auditHelper');
 
 /**
- * Helper internal untuk menyusun daftar flat menu (berdasarkan modul & submodul) menjadi hierarki tree untuk Sidebar
+ * Helper internal untuk menyusun daftar flat menu menjadi hierarki tree untuk Sidebar
+ * berdasarkan data referensi modul di m_settings (group = 'm_module')
+ * Aturan: Setiap data dengan group m_module pada m_settings WAJIB menjadi module di sidebar
+ * apabila sudah ada data di menu (m_menus) yg melibatkan m_module tersebut.
  */
-const buildNavTreeFromMenus = (menuList) => {
-    const moduleMap = new Map();
+const buildNavTreeFromMenus = (menuList, moduleSettings = []) => {
+    // 1. Normalisasi dan urutkan moduleSettings (dari m_settings group = 'm_module')
+    const activeModuleSettings = (moduleSettings || [])
+        .filter(s => s.status === 1 || s.status === true || s.status === undefined)
+        .sort((a, b) => {
+            const seqA = a.value2 !== null && a.value2 !== undefined && a.value2 !== '' ? Number(a.value2) : 999;
+            const seqB = b.value2 !== null && b.value2 !== undefined && b.value2 !== '' ? Number(b.value2) : 999;
+            if (seqA !== seqB) return seqA - seqB;
+            return (a.value1 || '').localeCompare(b.value1 || '');
+        });
 
-    for (const menu of menuList) {
-        const mod = menu.modul || menu.name || 'Lainnya';
-        if (!moduleMap.has(mod)) {
-            moduleMap.set(mod, []);
-        }
-        moduleMap.get(mod).push(menu);
-    }
-
+    const assignedMenuIds = new Set();
     const navTree = [];
 
-    for (const [modName, items] of moduleMap.entries()) {
-        items.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+    // Helper icon default per modul
+    const getDefaultModuleIcon = (modName) => {
+        const lower = (modName || '').toLowerCase();
+        if (lower.includes('dashboard')) return 'LayoutDashboard';
+        if (lower.includes('setup') || lower.includes('pengaturan')) return 'Settings';
+        if (lower.includes('jadwal') || lower.includes('penjadwalan')) return 'Calendar';
+        if (lower.includes('absen')) return 'ClipboardCheck';
+        if (lower.includes('uang') || lower.includes('keuangan') || lower.includes('kas')) return 'Calculator';
+        if (lower.includes('user') || lower.includes('pengguna')) return 'Users';
+        if (lower.includes('role') || lower.includes('hak akses')) return 'ShieldCheck';
+        return 'Layers';
+    };
 
-        // Jika hanya ada 1 item di modul dan path-nya ada serta submodul kosong, jadikan top-level menu langsung
-        if (items.length === 1 && !items[0].submodul && items[0].path) {
+    // 2. Iterasi setiap modul dari m_settings (group = 'm_module')
+    for (const setting of activeModuleSettings) {
+        const modName = (setting.value1 || setting.key || '').trim();
+        const modKey = (setting.key || '').trim().toLowerCase();
+        const modNameLower = modName.toLowerCase();
+
+        // Cocokkan menu berdasarkan kolom m.modul (case-insensitive)
+        const matchingMenus = menuList.filter(m => {
+            if (!m.modul) return false;
+            const mModLower = m.modul.trim().toLowerCase();
+            return mModLower === modNameLower || mModLower === modKey;
+        });
+
+        // Wajib menjadi module di sidebar jika ada data menu yang melibatkannya
+        if (matchingMenus.length === 0) {
+            continue;
+        }
+
+        matchingMenus.forEach(m => assignedMenuIds.add(m.id));
+        matchingMenus.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+
+        const modSequence = setting.value2 !== null && setting.value2 !== undefined && setting.value2 !== ''
+            ? Number(setting.value2)
+            : 999;
+
+        // Jika hanya ada 1 item di modul dan path-nya ada, submodul kosong, serta namanya sama dengan nama modul (seperti 'Dashboard')
+        if (matchingMenus.length === 1 && !matchingMenus[0].submodul && matchingMenus[0].path && 
+            matchingMenus[0].name.toLowerCase() === modNameLower) {
             navTree.push({
-                ...items[0],
+                ...matchingMenus[0],
+                sequence: modSequence,
                 children: []
             });
             continue;
         }
 
-        // Modul dengan grup submenu
-        const headerItem = items.find(i => i.name === modName && !i.submodul) || items[0];
-        const childItems = items.filter(i => i.id !== headerItem.id || (headerItem.path && items.length > 1));
-
+        // Modul dengan grup submenu (Level 2 & Level 3)
         const submodulGroups = new Map();
         const directChildren = [];
 
-        for (const item of childItems) {
-            if (item.submodul) {
-                if (!submodulGroups.has(item.submodul)) {
-                    submodulGroups.set(item.submodul, []);
+        for (const item of matchingMenus) {
+            if (item.submodul && item.submodul.trim()) {
+                const subKey = item.submodul.trim();
+                if (!submodulGroups.has(subKey)) {
+                    submodulGroups.set(subKey, []);
                 }
-                submodulGroups.get(item.submodul).push(item);
+                submodulGroups.get(subKey).push(item);
             } else {
                 directChildren.push({
                     ...item,
@@ -61,17 +100,19 @@ const buildNavTreeFromMenus = (menuList) => {
         const level2Children = [...directChildren];
 
         for (const [submodName, subItems] of submodulGroups.entries()) {
-            subItems.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
-            const subHeader = subItems.find(i => i.name === submodName) || subItems[0];
+            subItems.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+            const subHeader = subItems.find(i => i.name.toLowerCase() === submodName.toLowerCase()) || subItems[0];
             const level3Items = subItems.filter(i => i.id !== subHeader.id || (subHeader.path && subItems.length > 1));
 
             if (level3Items.length > 0) {
                 level2Children.push({
-                    id: subHeader.id || `sub-${submodName}`,
+                    id: subHeader.id && subHeader.name.toLowerCase() === submodName.toLowerCase() && !subHeader.path
+                        ? subHeader.id
+                        : `submod-${subHeader.id || submodName}`,
                     name: submodName,
                     path: subHeader.path || null,
                     icon: subHeader.icon || 'Folder',
-                    sequence: subHeader.sequence || 0,
+                    sequence: Number(subHeader.sequence) || 0,
                     children: level3Items.map(c => ({ ...c, children: [] }))
                 });
             } else {
@@ -82,19 +123,100 @@ const buildNavTreeFromMenus = (menuList) => {
             }
         }
 
-        level2Children.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+        level2Children.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
 
         navTree.push({
-            id: headerItem.id,
+            id: `module-${setting.id || setting.key.toLowerCase()}`,
             name: modName,
-            path: headerItem.path || null,
-            icon: headerItem.icon || 'Layers',
-            sequence: headerItem.sequence || 0,
+            path: null,
+            icon: getDefaultModuleIcon(modName),
+            sequence: modSequence,
             children: level2Children
         });
     }
 
-    navTree.sort((a, b) => (a.sequence || 0) - (b.sequence || 0) || a.name.localeCompare(b.name));
+    // 3. Fallback jika ada menu dengan modul yang belum terdaftar di m_settings
+    const unassignedMenus = menuList.filter(m => !assignedMenuIds.has(m.id));
+    if (unassignedMenus.length > 0) {
+        const unassignedGroups = new Map();
+        for (const menu of unassignedMenus) {
+            const mod = menu.modul || menu.name || 'Lainnya';
+            if (!unassignedGroups.has(mod)) {
+                unassignedGroups.set(mod, []);
+            }
+            unassignedGroups.get(mod).push(menu);
+        }
+
+        for (const [modName, items] of unassignedGroups.entries()) {
+            items.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+
+            if (items.length === 1 && !items[0].submodul && items[0].path) {
+                navTree.push({
+                    ...items[0],
+                    children: []
+                });
+                continue;
+            }
+
+            const headerItem = items.find(i => i.name.toLowerCase() === modName.toLowerCase() && !i.submodul) || items[0];
+            const childItems = items.filter(i => i.id !== headerItem.id || (headerItem.path && items.length > 1));
+
+            const submodulGroups = new Map();
+            const directChildren = [];
+
+            for (const item of childItems) {
+                if (item.submodul) {
+                    if (!submodulGroups.has(item.submodul)) {
+                        submodulGroups.set(item.submodul, []);
+                    }
+                    submodulGroups.get(item.submodul).push(item);
+                } else {
+                    directChildren.push({
+                        ...item,
+                        children: []
+                    });
+                }
+            }
+
+            const level2Children = [...directChildren];
+            for (const [submodName, subItems] of submodulGroups.entries()) {
+                subItems.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+                const subHeader = subItems.find(i => i.name.toLowerCase() === submodName.toLowerCase()) || subItems[0];
+                const level3Items = subItems.filter(i => i.id !== subHeader.id || (subHeader.path && subItems.length > 1));
+
+                if (level3Items.length > 0) {
+                    level2Children.push({
+                        id: `submod-${subHeader.id || submodName}`,
+                        name: submodName,
+                        path: subHeader.path || null,
+                        icon: subHeader.icon || 'Folder',
+                        sequence: Number(subHeader.sequence) || 0,
+                        children: level3Items.map(c => ({ ...c, children: [] }))
+                    });
+                } else {
+                    level2Children.push({
+                        ...subHeader,
+                        children: []
+                    });
+                }
+            }
+
+            level2Children.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+
+            navTree.push({
+                id: `module-${headerItem.id}`,
+                name: modName,
+                path: null,
+                icon: getDefaultModuleIcon(modName),
+                sequence: Number(headerItem.sequence) || 999,
+                children: level2Children
+            });
+        }
+    }
+
+    // Urutkan navigasi utama berdasarkan sequence ASC
+    navTree.sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0) || a.name.localeCompare(b.name));
+
     return navTree;
 };
 
@@ -125,7 +247,10 @@ const getAllMenus = async (req, res) => {
         }));
 
         if (tree === 'true') {
-            const menuTree = buildNavTreeFromMenus(formattedMenus);
+            const [moduleSettings] = await db.query(
+                "SELECT id, `key`, value1, value2, status FROM m_settings WHERE `group` = 'm_module' AND status = 1 ORDER BY CAST(value2 AS DECIMAL(10,2)) ASC, id ASC"
+            );
+            const menuTree = buildNavTreeFromMenus(formattedMenus, moduleSettings);
             return successResponse(res, menuTree, 'Daftar menu hierarkis berhasil diambil');
         }
 
@@ -372,12 +497,11 @@ const getUserNavigation = async (req, res) => {
                     MAX(rm.can_delete) AS can_delete,
                     MAX(rm.can_print) AS can_print
                  FROM m_menus m
-                 LEFT JOIN role_menus rm ON m.id = rm.menu_id AND rm.role_id IN (${placeholders})
+                 JOIN role_menus rm ON m.id = rm.menu_id AND rm.role_id IN (${placeholders})
                  WHERE m.is_active = 1
                    AND (
                        rm.can_show = 1
                        OR (rm.can_show IS NULL AND rm.can_read = 1)
-                       OR m.path IS NULL
                    )
                  GROUP BY m.id, m.modul, m.submodul, m.name, m.path, m.icon, m.sequence
                  ORDER BY m.sequence ASC, m.name ASC`,
@@ -395,8 +519,13 @@ const getUserNavigation = async (req, res) => {
             }));
         }
 
+        // Ambil data referensi modul dari m_settings (group = 'm_module' dan status = 1)
+        const [moduleSettings] = await db.query(
+            "SELECT id, `key`, value1, value2, status FROM m_settings WHERE `group` = 'm_module' AND status = 1 ORDER BY CAST(value2 AS DECIMAL(10,2)) ASC, id ASC"
+        );
+
         // Susun menjadi hierarki tree untuk kemudahan rendering sidebar di frontend
-        const navigationTree = buildNavTreeFromMenus(formatted);
+        const navigationTree = buildNavTreeFromMenus(formatted, moduleSettings);
 
         return successResponse(res, navigationTree, 'Navigasi menu user berhasil diambil');
     } catch (error) {

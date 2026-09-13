@@ -3,12 +3,22 @@ const express = require('express');
 const cors = require('cors');
 const db = require('./config/db'); // Memanggil file koneksi database tadi
 
+const path = require('path');
+const fs = require('fs');
+
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Pastikan direktori uploads untuk foto absensi tersedia
+const uploadsDir = path.join(__dirname, 'uploads', 'attendances');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
 // Middleware
 app.use(cors()); // Mengizinkan Vue.js mengakses API ini
-app.use(express.json()); // Agar Express bisa membaca request body berformat JSON
+app.use(express.json({ limit: '10mb' })); // Limit 10mb untuk foto selfie base64
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Static file serving untuk foto absensi
 
 // Routes
 const authRoutes = require('./routes/authRoutes');

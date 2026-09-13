@@ -20,13 +20,15 @@ const register = async (req, res) => {
 
         // Validasi input wajib
         if (!name || !email || !password) {
-            return badRequestResponse(res, 'Field name, email, dan password wajib diisi');
+            return badRequestResponse(res, 'Field name, email / username, dan password wajib diisi');
         }
 
-        // Validasi format email sederhana
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return badRequestResponse(res, 'Format email tidak valid');
+        const identifier = email.trim();
+        if (/\s/.test(identifier)) {
+            return badRequestResponse(res, 'Email atau username tidak boleh mengandung spasi');
+        }
+        if (identifier.length < 3) {
+            return badRequestResponse(res, 'Email atau username minimal 3 karakter');
         }
 
         // Validasi panjang password
@@ -34,13 +36,13 @@ const register = async (req, res) => {
             return badRequestResponse(res, 'Password minimal 6 karakter');
         }
 
-        // Cek apakah email sudah terdaftar
+        // Cek apakah email/username sudah terdaftar
         const [existingUsers] = await db.query(
             'SELECT id FROM users WHERE email = ?',
-            [email]
+            [identifier]
         );
         if (existingUsers.length > 0) {
-            return errorResponse(res, 'Email sudah terdaftar, gunakan email lain', 409);
+            return errorResponse(res, 'Email / username sudah terdaftar, gunakan yang lain', 409);
         }
 
         // Hash password menggunakan bcrypt dengan salt rounds 10
@@ -64,7 +66,7 @@ const register = async (req, res) => {
 
         await connection.query(
             'INSERT INTO users (id, name, email, password_hash, is_active) VALUES (?, ?, ?, ?, ?)',
-            [userId, name, email, password_hash, true]
+            [userId, name, identifier, password_hash, true]
         );
 
         // Insert ke user_roles jika ada role yang ditentukan
@@ -138,17 +140,19 @@ const login = async (req, res) => {
         const { email, password } = req.body;
 
         if (!email || !password) {
-            return badRequestResponse(res, 'Email dan password wajib diisi');
+            return badRequestResponse(res, 'Email / username dan password wajib diisi');
         }
 
-        // Cari user berdasarkan email (yang belum di soft-delete)
+        const identifier = email.trim();
+
+        // Cari user berdasarkan email atau username (yang belum di soft-delete)
         const [users] = await db.query(
             'SELECT id, name, email, password_hash, is_active, created_at FROM users WHERE email = ? AND deleted_at IS NULL',
-            [email]
+            [identifier]
         );
 
         if (users.length === 0) {
-            return unauthorizedResponse(res, 'Email atau password salah');
+            return unauthorizedResponse(res, 'Email / username atau password salah');
         }
 
         const user = users[0];
@@ -161,7 +165,7 @@ const login = async (req, res) => {
         // Verifikasi password hash
         const isPasswordMatch = await bcrypt.compare(password, user.password_hash);
         if (!isPasswordMatch) {
-            return unauthorizedResponse(res, 'Email atau password salah');
+            return unauthorizedResponse(res, 'Email / username atau password salah');
         }
 
         // Ambil data role user

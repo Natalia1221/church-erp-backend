@@ -126,6 +126,7 @@ CREATE TABLE `t_events` (
   `event_date` date NOT NULL,
   `title` varchar(100) DEFAULT NULL,
   `is_attendance` tinyint(1) DEFAULT '1',
+  `is_persembahan` tinyint(1) DEFAULT '0',
   `created_at` timestamp DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`) /*T![clustered_index] CLUSTERED */

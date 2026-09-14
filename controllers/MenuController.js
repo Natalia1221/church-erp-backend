@@ -465,8 +465,12 @@ const getUserNavigation = async (req, res) => {
              JOIN role_menus rm ON m.id = rm.menu_id AND rm.role_id IN (${placeholders})
              WHERE m.is_active = 1
                AND (
-                   rm.can_show = 1
-                   OR (rm.can_show IS NULL AND rm.can_read = 1)
+                   rm.can_read = 1
+                   OR rm.can_show = 1
+                   OR rm.can_create = 1
+                   OR rm.can_update = 1
+                   OR rm.can_delete = 1
+                   OR rm.can_print = 1
                )
              GROUP BY m.id, m.modul, m.submodul, m.name, m.path, m.icon, m.sequence
              ORDER BY m.sequence ASC, m.name ASC`,
@@ -489,9 +493,14 @@ const getUserNavigation = async (req, res) => {
         );
 
         // Susun menjadi hierarki tree untuk kemudahan rendering sidebar di frontend
-        const navigationTree = buildNavTreeFromMenus(formatted, moduleSettings);
+        // Hanya tampilkan menu yang dapat dibaca (can_read) atau dapat ditampilkan (can_show) di navigasi sidebar
+        const visibleNavMenus = formatted.filter(m => m.can_read || m.can_show);
+        const navigationTree = buildNavTreeFromMenus(visibleNavMenus, moduleSettings);
 
-        return successResponse(res, navigationTree, 'Navigasi menu user berhasil diambil');
+        return successResponse(res, {
+            menus: navigationTree,
+            permissions: formatted
+        }, 'Navigasi menu user berhasil diambil');
     } catch (error) {
         console.error('Error getUserNavigation:', error);
         return errorResponse(res, 'Terjadi kesalahan pada server saat mengambil navigasi menu', 500, error.message);

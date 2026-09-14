@@ -21,6 +21,7 @@ const getAllSermons = async (req, res) => {
                 DATE_FORMAT(e.event_date, '%Y-%m-%d') AS event_date,
                 e.title,
                 COALESCE(e.is_attendance, 1) AS is_attendance,
+                COALESCE(e.is_persembahan, 0) AS is_persembahan,
                 e.created_at,
                 (SELECT COUNT(DISTINCT ur.user_id) 
                  FROM user_roles ur 
@@ -134,13 +135,19 @@ const getSermonById = async (req, res) => {
 const createSermon = async (req, res) => {
     let connection;
     try {
-        const { event_date, is_attendance = true } = req.body;
+        const { event_date, is_attendance, is_persembahan } = req.body;
 
-        if (!event_date || !event_date.trim()) {
-            return badRequestResponse(res, 'Tanggal acara sermon wajib diisi');
+        if (!event_date) {
+            return badRequestResponse(res, 'Field event_date wajib diisi');
         }
 
         const trimmedDate = event_date.trim();
+
+        // Validasi format tanggal YYYY-MM-DD
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+        if (!dateRegex.test(trimmedDate)) {
+            return badRequestResponse(res, 'Format tanggal harus YYYY-MM-DD (contoh: 2026-09-13)');
+        }
 
         // Validasi: Tidak boleh ada acara Sermon ganda pada tanggal yang sama
         const [existingDate] = await db.query(
@@ -158,15 +165,16 @@ const createSermon = async (req, res) => {
         const generatedTitle = `SERMON_${trimmedDate}`;
         const eventId = crypto.randomUUID();
         const activeAttendance = (is_attendance === false || is_attendance === 0 || is_attendance === '0' || is_attendance === 'false') ? 0 : 1;
+        const activePersembahan = (is_persembahan === true || is_persembahan === 1 || is_persembahan === '1' || is_persembahan === 'true') ? 1 : 0;
 
         connection = await db.getConnection();
         await connection.beginTransaction();
 
         // 1. Simpan acara ke t_events dengan event_type = 'SERMON'
         await connection.query(
-            `INSERT INTO t_events (id, event_type, event_date, title, is_attendance) 
-             VALUES (?, 'SERMON', ?, ?, ?)`,
-            [eventId, trimmedDate, generatedTitle, activeAttendance]
+            `INSERT INTO t_events (id, event_type, event_date, title, is_attendance, is_persembahan) 
+             VALUES (?, 'SERMON', ?, ?, ?, ?)`,
+            [eventId, trimmedDate, generatedTitle, activeAttendance, activePersembahan]
         );
 
         // Hitung total GSM aktif untuk info respons
@@ -255,9 +263,97 @@ const deleteSermon = async (req, res) => {
     }
 };
 
+// Update Acara Sermon
+const updateSermon = async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const { event_date, is_attendance, is_persembahan } = req.body;
+
+        const [existing] = await db.query('SELECT * FROM t_events WHERE id = ? AND event_type = \'SERMON\'', [id]);
+        if (existing.length === 0) {
+            return notFoundResponse(res, `Acara Sermon dengan ID '${id}' tidak ditemukan`);
+        }
+
+        const currentEvent = existing[0];
+        let trimmedDate = currentEvent.event_date;
+        let generatedTitle = currentEvent.title;
+
+        if (event_date && String(event_date).trim()) {
+            trimmedDate = String(event_date).trim();
+
+            const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+            if (!dateRegex.test(trimmedDate)) {
+                return badRequestResponse(res, 'Format tanggal harus YYYY-MM-DD (contoh: 2026-09-13)');
+            }
+
+            // Cek duplikasi jika tanggal berubah
+            const [existingDate] = await db.query(
+                "SELECT id, title FROM t_events WHERE event_type = 'SERMON' AND event_date = ? AND id != ?",
+                [trimmedDate, id]
+            );
+            if (existingDate.length > 0) {
+                return badRequestResponse(
+                    res,
+                    `Acara Sermon untuk tanggal ${trimmedDate} sudah ada (${existingDate[0].title}).`
+                );
+            }
+
+            generatedTitle = `SERMON_${trimmedDate}`;
+        }
+
+        const activeAttendance = is_attendance !== undefined
+            ? ((is_attendance === false || is_attendance === 0 || is_attendance === '0' || is_attendance === 'false') ? 0 : 1)
+            : currentEvent.is_attendance;
+
+        const activePersembahan = is_persembahan !== undefined
+            ? ((is_persembahan === true || is_persembahan === 1 || is_persembahan === '1' || is_persembahan === 'true') ? 1 : 0)
+            : currentEvent.is_persembahan;
+
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        await connection.query(
+            `UPDATE t_events 
+             SET event_date = ?, title = ?, is_attendance = ?, is_persembahan = ? 
+             WHERE id = ?`,
+            [trimmedDate, generatedTitle, activeAttendance, activePersembahan, id]
+        );
+
+        // Jika tanggal berubah, update juga transaction_date pada t_cash_transactions yang terkait jika ada
+        await connection.query(
+            'UPDATE t_cash_transactions SET transaction_date = ? WHERE event_id = ?',
+            [trimmedDate, id]
+        );
+
+        await connection.commit();
+
+        await logAudit({
+            userId: req.user?.id || null,
+            action: 'UPDATE',
+            tableName: 't_events',
+            description: `Mengubah acara Sermon: ${generatedTitle} (ID: ${id})`
+        });
+
+        const [updatedRows] = await db.query(
+            "SELECT id, event_type, DATE_FORMAT(event_date, '%Y-%m-%d') AS event_date, title, is_attendance, is_persembahan FROM t_events WHERE id = ?",
+            [id]
+        );
+
+        return successResponse(res, updatedRows[0], 'Acara Sermon berhasil diperbarui');
+    } catch (error) {
+        if (connection) await connection.rollback();
+        console.error('Error updateSermon:', error);
+        return errorResponse(res, 'Terjadi kesalahan pada server saat memperbarui acara sermon', 500, error.message);
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
 module.exports = {
     getAllSermons,
     getSermonById,
     createSermon,
+    updateSermon,
     deleteSermon
 };

@@ -32,6 +32,10 @@ const mingguRoutes = require('./routes/mingguRoutes');
 const lainnyaRoutes = require('./routes/lainnyaRoutes');
 const attendanceRoutes = require('./routes/attendanceRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
+const financeCategoryRoutes = require('./routes/financeCategoryRoutes');
+const persembahanRoutes = require('./routes/persembahanRoutes');
+const kasLainnyaRoutes = require('./routes/kasLainnyaRoutes');
+const financialReportRoutes = require('./routes/financialReportRoutes');
 
 // Route dasar (Root) untuk memastikan API berjalan
 app.get('/', (req, res) => {
@@ -41,7 +45,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// Endpoint Modul Auth, Role, User, Menu, Setting, Kategori, Sermon, Minggu, Lainnya, Absensi, dan Dashboard
+// Endpoint Modul Auth, Role, User, Menu, Setting, Kategori, Sermon, Minggu, Lainnya, Absensi, Dashboard, Kategori Keuangan, Persembahan, Kas Lainnya, dan Laporan Keuangan
 app.use('/api/auth', authRoutes);
 app.use('/api/roles', roleRoutes);
 app.use('/api/users', userRoutes);
@@ -53,6 +57,11 @@ app.use('/api/minggu', mingguRoutes);
 app.use('/api/lainnya', lainnyaRoutes);
 app.use('/api/attendances', attendanceRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/finance-categories', financeCategoryRoutes);
+app.use('/api/persembahan', persembahanRoutes);
+app.use('/api/kas-lainnya', kasLainnyaRoutes);
+app.use('/api/laporan-keuangan', financialReportRoutes);
+app.use('/api/financial-report', financialReportRoutes);
 
 // Menyalakan Server jika dijalankan secara lokal/standalone
 if (require.main === module || !process.env.VERCEL) {

@@ -21,6 +21,7 @@ const getAllLainnya = async (req, res) => {
                 DATE_FORMAT(e.event_date, '%Y-%m-%d') AS event_date,
                 e.title,
                 COALESCE(e.is_attendance, 0) AS is_attendance,
+                COALESCE(e.is_persembahan, 0) AS is_persembahan,
                 e.created_at,
                 (SELECT COUNT(DISTINCT ur.user_id) 
                  FROM user_roles ur 
@@ -134,14 +135,14 @@ const getLainnyaById = async (req, res) => {
 const createLainnya = async (req, res) => {
     let connection;
     try {
-        const { title, event_date, is_attendance = false } = req.body;
+        const { title, event_date, is_attendance, is_persembahan } = req.body;
 
         if (!title || !title.trim()) {
-            return badRequestResponse(res, 'Nama acara (title) wajib diisi');
+            return badRequestResponse(res, 'Judul acara lainnya wajib diisi');
         }
 
         if (!event_date || !event_date.trim()) {
-            return badRequestResponse(res, 'Tanggal acara wajib diisi');
+            return badRequestResponse(res, 'Tanggal acara lainnya wajib diisi');
         }
 
         const trimmedTitle = title.trim();
@@ -155,15 +156,16 @@ const createLainnya = async (req, res) => {
 
         const eventId = crypto.randomUUID();
         const activeAttendance = (is_attendance === false || is_attendance === 0 || is_attendance === '0' || is_attendance === 'false') ? 0 : 1;
+        const activePersembahan = (is_persembahan === true || is_persembahan === 1 || is_persembahan === '1' || is_persembahan === 'true') ? 1 : 0;
 
         connection = await db.getConnection();
         await connection.beginTransaction();
 
         // 1. Simpan acara ke t_events dengan event_type = 'LAINNYA'
         await connection.query(
-            `INSERT INTO t_events (id, event_type, event_date, title, is_attendance) 
-             VALUES (?, 'LAINNYA', ?, ?, ?)`,
-            [eventId, trimmedDate, trimmedTitle, activeAttendance]
+            `INSERT INTO t_events (id, event_type, event_date, title, is_attendance, is_persembahan) 
+             VALUES (?, 'LAINNYA', ?, ?, ?, ?)`,
+            [eventId, trimmedDate, trimmedTitle, activeAttendance, activePersembahan]
         );
 
         // Hitung total GSM aktif untuk info respons
@@ -252,9 +254,86 @@ const deleteLainnya = async (req, res) => {
     }
 };
 
+// Update Acara Lainnya
+const updateLainnya = async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const { title, event_date, is_attendance, is_persembahan } = req.body;
+
+        const [existing] = await db.query('SELECT * FROM t_events WHERE id = ? AND event_type = \'LAINNYA\'', [id]);
+        if (existing.length === 0) {
+            return notFoundResponse(res, `Acara Lainnya dengan ID '${id}' tidak ditemukan`);
+        }
+
+        const currentEvent = existing[0];
+        let trimmedTitle = currentEvent.title;
+        let trimmedDate = currentEvent.event_date;
+
+        if (title && title.trim()) {
+            trimmedTitle = title.trim();
+        }
+
+        if (event_date && String(event_date).trim()) {
+            trimmedDate = String(event_date).trim();
+            const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+            if (!dateRegex.test(trimmedDate)) {
+                return badRequestResponse(res, 'Format tanggal tidak valid (harus YYYY-MM-DD)');
+            }
+        }
+
+        const activeAttendance = is_attendance !== undefined
+            ? ((is_attendance === false || is_attendance === 0 || is_attendance === '0' || is_attendance === 'false') ? 0 : 1)
+            : currentEvent.is_attendance;
+
+        const activePersembahan = is_persembahan !== undefined
+            ? ((is_persembahan === true || is_persembahan === 1 || is_persembahan === '1' || is_persembahan === 'true') ? 1 : 0)
+            : currentEvent.is_persembahan;
+
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        await connection.query(
+            `UPDATE t_events 
+             SET title = ?, event_date = ?, is_attendance = ?, is_persembahan = ? 
+             WHERE id = ?`,
+            [trimmedTitle, trimmedDate, activeAttendance, activePersembahan, id]
+        );
+
+        // Jika tanggal berubah, update juga transaction_date pada t_cash_transactions yang terkait jika ada
+        await connection.query(
+            'UPDATE t_cash_transactions SET transaction_date = ? WHERE event_id = ?',
+            [trimmedDate, id]
+        );
+
+        await connection.commit();
+
+        await logAudit({
+            userId: req.user?.id || null,
+            action: 'UPDATE',
+            tableName: 't_events',
+            description: `Mengubah acara Lainnya: ${trimmedTitle} (ID: ${id})`
+        });
+
+        const [updatedRows] = await db.query(
+            "SELECT id, event_type, DATE_FORMAT(event_date, '%Y-%m-%d') AS event_date, title, is_attendance, is_persembahan FROM t_events WHERE id = ?",
+            [id]
+        );
+
+        return successResponse(res, updatedRows[0], 'Acara Lainnya berhasil diperbarui');
+    } catch (error) {
+        if (connection) await connection.rollback();
+        console.error('Error updateLainnya:', error);
+        return errorResponse(res, 'Terjadi kesalahan pada server saat memperbarui acara lainnya', 500, error.message);
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
 module.exports = {
     getAllLainnya,
     getLainnyaById,
     createLainnya,
+    updateLainnya,
     deleteLainnya
 };
